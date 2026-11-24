@@ -88,7 +88,7 @@ entries if you prefer those keys to reach applications.
 `HOTKEYS` in `src/config.rs` maps key combinations to byte sequences that are
 sent to the foreground program. Entries are checked before `SHORTCUTS` and the
 `KEY` table, so they override the default binding for the same combination.
-The default table adds one common terminal hotkey:
+The default table adds the common terminal hotkeys:
 
 ```rust
 pub static HOTKEYS: &[Hotkey] = &[
@@ -97,6 +97,17 @@ pub static HOTKEYS: &[Hotkey] = &[
         mask: ShiftMask,
         keysym: x11::keysym::XK_Return as u64,
         seq: b"\x1b\r",
+    },
+    // Ctrl+Home/End: application transcript top/bottom (rxvt encoding).
+    Hotkey {
+        mask: ControlMask,
+        keysym: x11::keysym::XK_Home as u64,
+        seq: b"\x1b[7^",
+    },
+    Hotkey {
+        mask: ControlMask,
+        keysym: x11::keysym::XK_End as u64,
+        seq: b"\x1b[8^",
     },
 ];
 ```
@@ -110,6 +121,11 @@ st's own actions (copy, paste, zoom, scrollback, ...) belong in `SHORTCUTS`;
 hotkeys only send bytes. Comment out an entry to restore the original st
 mapping.
 
+The Ctrl+Home/End sequences are the rxvt spellings of the modified keys. They
+let full-screen programs that maintain their own transcript (pi, for example)
+jump to its beginning and end; plain Home/End still reach those programs as
+unmodified keys.
+
 ### Scrollback
 
 The main screen keeps up to `SCROLLBACK` lines of history (10000 by default;
@@ -118,9 +134,17 @@ the full-screen main buffer; the alternate screen is not saved. Default
 controls:
 
 * `Shift+PageUp` / `Shift+PageDown` scroll by a page.
-* `Ctrl+Home` / `Ctrl+End` jump to the oldest line / back to the live screen.
-* `Shift+MouseWheelUp` / `Shift+MouseWheelDown` scroll line by line.
+* `Shift+Home` / `Shift+End` jump to the oldest line / back to the live screen.
+* The mouse wheel scrolls line by line on the main screen, with or without
+  `Shift`. On the alternate screen the wheel belongs to the application, which
+  can use it to scroll its own view (as full-screen editors and pagers do).
 * Any input, paste or mouse report returns to the live screen.
+
+Ctrl+Home and Ctrl+End are not scrollback shortcuts: they are sent to the
+foreground program through `HOTKEYS`, since full-screen programs commonly use
+them. The history is still reachable with `Shift+PageUp` while an alternate
+screen program is running; scrolling there shows the hidden main screen above
+the application.
 
 Scrolling only changes the view: the terminal keeps parsing output and the
 live screen keeps updating. Selection and copying, URL clicking, and the
@@ -239,11 +263,12 @@ The suite covers:
   terminal exercise bold/faint/italic/underline/struck/reverse/invisible
   attributes, palette/true colour cells, DEC line drawing, wide characters and
   reverse video.
-* Configured hotkeys: `Shift+Enter` delivers its configured byte sequence to
-  the child process.
-* Scrollback: after 20 lines on a 5-row terminal, `Ctrl+Home` followed by
-  `Shift+PrintScreen` dumps the oldest lines, and `Ctrl+End` returns to the
-  live screen.
+* Configured hotkeys: `Shift+Enter` and `Ctrl+Home`/`Ctrl+End` deliver their
+  configured byte sequences to the child process.
+* Scrollback: after 20 lines on a 5-row terminal, `Shift+Home` followed by
+  `Shift+PrintScreen` dumps the oldest lines, and `Shift+End` returns to the
+  live screen. The plain mouse wheel scrolls the history, and in the alternate
+  screen `Shift+wheel` is forwarded to the application as a mouse report.
 * Mouse selection, PRIMARY/CLIPBOARD copy, and bracketed paste are exercised
   end to end.
 * Runtime font zoom (Ctrl+Plus/Minus/0, Ctrl+=, Ctrl+Shift+-), clamping at the
@@ -287,9 +312,13 @@ destroy callbacks can reach the state; the rest is regular Rust ownership.
   `clickurl` patch.
 * `Shift+Enter` is a hotkey in `HOTKEYS` (ESC CR) instead of st's default
   `\r` mapping.
-* The main screen keeps a scrollback history; `Ctrl+Home` / `Ctrl+End` and
+* The main screen keeps a scrollback history; `Shift+Home` / `Shift+End` and
   `Shift+PageUp` / `Shift+PageDown` are scrollback shortcuts instead of the
-  original key sequences. Set `SCROLLBACK = 0` to disable history.
+  original key sequences, and the wheel scrolls the history on the main
+  screen. Set `SCROLLBACK = 0` to disable history.
+* `Ctrl+Home` / `Ctrl+End` are hotkeys that send the rxvt modified Home/End
+  sequences (`ESC[7^`, `ESC[8^`) instead of st's default `ESC[J`/`ESC[4~`
+  mappings, so full-screen programs receive the modified keys.
 * Drag-and-drop follows the `drag-n-drop` patch: dropped URIs are decoded and
   shell-escaped before being pasted. XdndFinished reports success per the XDND
   specification instead of the item count.

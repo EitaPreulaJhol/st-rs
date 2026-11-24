@@ -238,6 +238,10 @@ pub struct MouseShortcut {
     pub func: fn(&mut App, &Arg),
     pub arg: Arg,
     pub release: bool,
+    /// Restrict the shortcut to one screen buffer: 0 = any, 1 = alternate
+    /// screen only, -1 = main screen only.  Wheel shortcuts use -1 so that
+    /// full-screen applications receive their own wheel events.
+    pub altscrn: i32,
 }
 
 /// A user-defined key binding that sends a byte sequence to the terminal.
@@ -1734,21 +1738,25 @@ pub const IGNOREMOD: u32 = Mod2Mask | XK_SWITCH_MOD;
 
 /// Internal mouse shortcuts.
 pub static MSHORTCUTS: &[MouseShortcut] = &[
-    // Shift+wheel scrolls the terminal's own history instead of sending the
-    // usual cursor-key sequences to the application.
+    // The wheel scrolls the terminal's own history on the main screen, with
+    // or without modifiers.  It is not used on the alternate screen: there
+    // the wheel belongs to the full-screen application (see the
+    // scrollback-mouse-altscreen patch).
     MouseShortcut {
-        mask: ShiftMask,
+        mask: XK_ANY_MOD,
         button: Button4,
         func: App::kscrollup,
         arg: Arg::i(1),
         release: false,
+        altscrn: -1,
     },
     MouseShortcut {
-        mask: ShiftMask,
+        mask: XK_ANY_MOD,
         button: Button5,
         func: App::kscrolldown,
         arg: Arg::i(1),
         release: false,
+        altscrn: -1,
     },
     MouseShortcut {
         mask: XK_ANY_MOD,
@@ -1756,6 +1764,7 @@ pub static MSHORTCUTS: &[MouseShortcut] = &[
         func: App::selpaste,
         arg: Arg::i(0),
         release: true,
+        altscrn: 0,
     },
     MouseShortcut {
         mask: ShiftMask,
@@ -1763,6 +1772,7 @@ pub static MSHORTCUTS: &[MouseShortcut] = &[
         func: App::ttysend,
         arg: Arg::s(b"\x1b[5;2~"),
         release: false,
+        altscrn: 0,
     },
     MouseShortcut {
         mask: XK_ANY_MOD,
@@ -1770,6 +1780,7 @@ pub static MSHORTCUTS: &[MouseShortcut] = &[
         func: App::ttysend,
         arg: Arg::s(b"\x19"),
         release: false,
+        altscrn: 0,
     },
     MouseShortcut {
         mask: ShiftMask,
@@ -1777,6 +1788,7 @@ pub static MSHORTCUTS: &[MouseShortcut] = &[
         func: App::ttysend,
         arg: Arg::s(b"\x1b[6;2~"),
         release: false,
+        altscrn: 0,
     },
     MouseShortcut {
         mask: XK_ANY_MOD,
@@ -1784,6 +1796,7 @@ pub static MSHORTCUTS: &[MouseShortcut] = &[
         func: App::ttysend,
         arg: Arg::s(b"\x05"),
         release: false,
+        altscrn: 0,
     },
 ];
 
@@ -1807,6 +1820,20 @@ pub static HOTKEYS: &[Hotkey] = &[
         mask: ShiftMask,
         keysym: x11::keysym::XK_KP_Enter as u64,
         seq: b"\x1b\r",
+    },
+    // Ctrl+Home and Ctrl+End are application keys: full-screen programs use
+    // them to jump to the top/bottom of their own scrollback.  Send the
+    // rxvt spellings, which TUIs (including pi and rxvt-based programs)
+    // understand, instead of the modifier-less Home/End sequences.
+    Hotkey {
+        mask: ControlMask,
+        keysym: x11::keysym::XK_Home as u64,
+        seq: b"\x1b[7^",
+    },
+    Hotkey {
+        mask: ControlMask,
+        keysym: x11::keysym::XK_End as u64,
+        seq: b"\x1b[8^",
     },
 ];
 
@@ -1836,9 +1863,11 @@ pub static SHORTCUTS: &[Shortcut] = &[
         func: App::printsel,
         arg: Arg::i(0),
     },
-    // Scrollback: Shift+PageUp/PageDown scroll by a page, Ctrl+Home/End jump
-    // to the oldest/newest line.  They are checked before `KEY`, so they no
-    // longer send the default PageUp/PageDown/Home/End sequences.
+    // Scrollback: Shift+PageUp/PageDown scroll by a page, Shift+Home/End
+    // jump to the oldest/newest line.  They are checked before `KEY`, so they
+    // no longer send the default PageUp/PageDown/Home/End sequences.
+    // Ctrl+Home/End are intentionally not used here: they are hotkeys that
+    // full-screen applications rely on for their own transcripts.
     Shortcut {
         mask: ShiftMask,
         keysym: x11::keysym::XK_Prior as u64,
@@ -1852,13 +1881,13 @@ pub static SHORTCUTS: &[Shortcut] = &[
         arg: Arg::i(-1),
     },
     Shortcut {
-        mask: ControlMask,
+        mask: ShiftMask,
         keysym: x11::keysym::XK_Home as u64,
         func: App::kscrollup,
         arg: Arg::i(i32::MAX),
     },
     Shortcut {
-        mask: ControlMask,
+        mask: ShiftMask,
         keysym: x11::keysym::XK_End as u64,
         func: App::kscrolldown,
         arg: Arg::i(i32::MAX),

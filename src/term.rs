@@ -1114,10 +1114,11 @@ impl App {
 
     /// Scroll the viewport up (towards older lines).  `Arg::i(-1)` scrolls a
     /// page; a large positive value goes to the oldest line.
+    ///
+    /// The main screen's history is shown above the alternate screen too, as
+    /// in the upstream scrollback patch, so the key is never a silent no-op
+    /// inside a full-screen program.
     pub fn kscrollup(&mut self, arg: &Arg) {
-        if self.is_set(MODE_ALTSCREEN) {
-            return;
-        }
         let mut n = match arg.0 {
             ArgVal::I(n) => n,
             _ => 1,
@@ -3036,20 +3037,25 @@ mod tests {
     }
 
     #[test]
-    fn scrollback_ignores_alt_screen() {
+    fn scrollback_alt_screen_shows_main_history() {
         let mut app = new_app(10, 3);
         feed(&mut app, b"a\r\nb\r\nc\r\nd\r\n");
         let histlen = app.term.hist.len();
         assert_eq!(histlen, 2);
 
+        feed(&mut app, b"\x1b[?1049h");
+        assert_ne!(app.term.mode & MODE_ALTSCREEN, 0);
+        feed(&mut app, b"x\r\ny\r\nz\r\nw");
+        assert_eq!(app.term.hist.len(), histlen);
+
+        // The history belongs to the main screen and is still reachable from
+        // the alternate screen; the alternate lines themselves are not saved.
         app.kscrollup(&Arg::i(1));
         assert_eq!(app.term.scr, 1);
-
-        feed(&mut app, b"\x1b[?1049h");
-        assert_eq!(app.term.scr, 0);
-        feed(&mut app, b"x\r\ny\r\nz\r\nw\r\n");
-        assert_eq!(app.term.hist.len(), histlen);
-        app.kscrollup(&Arg::i(1));
+        assert_eq!(row_text(&app, 0), "b");
+        assert_eq!(row_text(&app, 1), "y");
+        assert_eq!(row_text(&app, 2), "z");
+        app.kscrolldown(&Arg::i(i32::MAX));
         assert_eq!(app.term.scr, 0);
 
         feed(&mut app, b"\x1b[?1049l");

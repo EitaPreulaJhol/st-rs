@@ -191,6 +191,8 @@ HOTKEY_WID=$(cat "$HOTKEY_WIDF")
 "$XTOOL" focus "$HOTKEY_WID"
 sleep 0.4
 "$XTOOL" key "$HOTKEY_WID" s Return
+"$XTOOL" key "$HOTKEY_WID" c Home
+"$XTOOL" key "$HOTKEY_WID" c End
 last=-1 size=0 stable=0
 for _ in $(seq 1 60); do
 	size=$(stat -c %s "$HOTKEY_OUT" 2>/dev/null || echo 0)
@@ -206,13 +208,13 @@ done
 kill "$HOTKEY_PID" 2>/dev/null || true
 wait "$HOTKEY_PID" 2>/dev/null || true
 [ ! -s "$HOTKEY_ERR" ] || { cat "$HOTKEY_ERR"; fail "stderr from hotkey test"; }
-printf '\033\r' >"$WORK/hotkeys.expected"
+printf '\033\r\033[7^\033[8^' >"$WORK/hotkeys.expected"
 cmp -s "$HOTKEY_OUT" "$WORK/hotkeys.expected" || {
 	echo "--- hotkey output ---"
 	od -c "$HOTKEY_OUT"
 	fail "configured hotkeys sent unexpected bytes"
 }
-echo "Shift-Enter sends the configured sequence"
+echo "Shift-Enter, Ctrl-Home and Ctrl-End send the configured sequences"
 
 # ---------------------------------------------------------------------------
 # Scrollback
@@ -237,7 +239,7 @@ scrollback_run() { # TAG SECOND_MOD SECOND_KEY WANT
 	# only the Shift-PrintScreen view is examined.
 	local base
 	base=$(stat -c %s "$dump")
-	"$XTOOL" key "$wid" c Home
+	"$XTOOL" key "$wid" s Home
 	if [ -n "$m2" ]; then
 		sleep 0.3
 		"$XTOOL" key "$wid" "$m2" "$k2"
@@ -259,10 +261,82 @@ scrollback_run() { # TAG SECOND_MOD SECOND_KEY WANT
 	}
 }
 
-step "scrollback: Ctrl+Home and Ctrl+End"
+step "scrollback: Shift+Home and Shift+End"
 scrollback_run top "" "" "line01"
-scrollback_run bottom c End "line20"
-echo "scrollback history is reachable and Ctrl+End returns to the live screen"
+scrollback_run bottom s End "line20"
+echo "scrollback history is reachable and Shift+End returns to the live screen"
+
+# The wheel scrolls the terminal's own history on the main screen, and is
+# left to full-screen applications on the alternate screen.
+scrollback_wheel_run() {
+	local widf="$WORK/wid_scroll_wheel" readyf="$WORK/ready_scroll_wheel"
+	local dump="$WORK/scroll_wheel" errf="$WORK/scroll_wheel_err"
+	rm -f "$widf" "$readyf" "$dump" "$errf"
+	"$BIN" -g 20x5 -o "$dump" -e sh -c \
+		"echo \$WINDOWID > '$widf'; i=1; while [ \$i -le 20 ]; do printf 'line%02d\r\n' \$i; i=\$((i+1)); done; echo ready > '$readyf'; sleep 30" \
+		>/dev/null 2>"$errf" &
+	local pid=$!
+	wait_file "$widf" || { cat "$errf"; fail "wheel test did not start"; }
+	wait_file "$readyf" || { cat "$errf"; fail "wheel output did not finish"; }
+	local wid
+	wid=$(cat "$widf")
+	"$XTOOL" focus "$wid"
+	sleep 0.3
+	local base
+	base=$(stat -c %s "$dump")
+	"$XTOOL" wheel "$wid" "" 4 3
+	sleep 0.3
+	"$XTOOL" key "$wid" s Print
+	for _ in $(seq 1 60); do
+		[ "$(stat -c %s "$dump" 2>/dev/null || echo "$base")" -gt "$base" ] && break
+		sleep 0.05
+	done
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+	[ ! -s "$errf" ] || { cat "$errf"; fail "stderr from wheel test"; }
+	tail -c +$((base + 1)) "$dump" >"$WORK/scroll_wheel_view"
+	grep -q "line14" "$WORK/scroll_wheel_view" || {
+		echo "--- wheel view ---"
+		cat "$WORK/scroll_wheel_view"
+		fail "plain wheel did not scroll the history"
+	}
+}
+
+step "scrollback: plain mouse wheel on the main screen"
+scrollback_wheel_run
+
+echo "the wheel scrolls main-screen history"
+
+alt_wheel_test() {
+	local widf="$WORK/wid_altwheel" out="$WORK/altwheel" errf="$WORK/altwheel_err"
+	rm -f "$widf" "$out" "$errf"
+	# Enter the alternate screen, enable SGR mouse reporting and capture
+	# whatever bytes st forwards.  Shift+wheel must be a mouse report, not a
+	# native scroll and not the Shift+PageUp key sequence.
+	"$BIN" -g 20x5 -e sh -c \
+		"echo \$WINDOWID > '$widf'; printf '\033[?1049h\033[?1000h\033[?1006h'; stty raw -echo; dd bs=1 count=32 of='$out' 2>/dev/null" \
+		>/dev/null 2>"$errf" &
+	local pid=$!
+	wait_file "$widf" || { cat "$errf"; fail "alt wheel test did not start"; }
+	local wid
+	wid=$(cat "$widf")
+	"$XTOOL" focus "$wid"
+	sleep 0.5
+	"$XTOOL" wheel "$wid" s 4 1
+	wait_file "$out" || true
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+	[ ! -s "$errf" ] || { cat "$errf"; fail "stderr from alt wheel test"; }
+	LC_ALL=C grep -q $'\x1b\[<68;' "$out" || {
+		echo "--- alt wheel bytes ---"
+		od -c "$out" 2>/dev/null || true
+		fail "Shift+wheel on the alternate screen was not forwarded to the application"
+	}
+}
+
+step "scrollback: wheel goes to full-screen applications"
+alt_wheel_test
+echo "the alternate screen receives Shift+wheel as a mouse report"
 
 # ---------------------------------------------------------------------------
 # Selection, clipboard, bracketed paste

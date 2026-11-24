@@ -42,6 +42,7 @@ static void usage(void)
 	        "       xtool key WID MODS KEYSYM\n"
 	        "       xtool type WID STRING\n"
 	        "       xtool zoom WID MODE [N] [MS]\n"
+	        "       xtool wheel WID MODS BUTTON [N] [MS]\n"
 	        "       xtool select WID BORDER CW CH C0 R0 C1 R1 PRIMARY [CLIPBOARD]\n");
 	exit(2);
 }
@@ -294,6 +295,51 @@ static void zoom_mode(Window w, const char *mode, int count, int delay_ms)
 	}
 }
 
+static void wheel(Window w, const char *mods, unsigned int button, int count,
+                  int delay_ms)
+{
+	int shift, ctrl, alt, i;
+	int rx, ry;
+	Window child;
+	XWindowAttributes attr;
+	KeyCode sh = XKeysymToKeycode(dpy, XK_Shift_L);
+	KeyCode ct = XKeysymToKeycode(dpy, XK_Control_L);
+	KeyCode al = XKeysymToKeycode(dpy, XK_Alt_L);
+
+	parse_mods(mods, &shift, &ctrl, &alt);
+	if (button != Button4 && button != Button5)
+		die("wheel button must be 4 or 5");
+
+	focus(w);
+	if (!XGetWindowAttributes(dpy, w, &attr))
+		die("cannot get window attributes");
+	XTranslateCoordinates(dpy, w, DefaultRootWindow(dpy), attr.width / 2,
+	                      attr.height / 2, &rx, &ry, &child);
+	XWarpPointer(dpy, None, DefaultRootWindow(dpy), 0, 0, 0, 0, rx, ry);
+	XSync(dpy, False);
+	usleep(150000);
+
+	if (ctrl)
+		fakekey(dpy, ct, True, 0);
+	if (alt)
+		fakekey(dpy, al, True, 0);
+	if (shift)
+		fakekey(dpy, sh, True, 0);
+	for (i = 0; i < count; i++) {
+		fakebutton(dpy, button, True, 0);
+		fakebutton(dpy, button, False, 0);
+		XSync(dpy, False);
+		usleep((useconds_t)delay_ms * 1000);
+	}
+	if (shift)
+		fakekey(dpy, sh, False, 0);
+	if (alt)
+		fakekey(dpy, al, False, 0);
+	if (ctrl)
+		fakekey(dpy, ct, False, 0);
+	XSync(dpy, False);
+}
+
 int main(int argc, char **argv)
 {
 	const char *cmd;
@@ -327,6 +373,11 @@ int main(int argc, char **argv)
 		int count = argc >= 5 ? atoi(argv[4]) : 1;
 		int delay_ms = argc >= 6 ? atoi(argv[5]) : 40;
 		zoom_mode((Window)strtoul(argv[2], NULL, 0), argv[3], count, delay_ms);
+	} else if (!strcmp(cmd, "wheel") && (argc == 5 || argc == 6 || argc == 7)) {
+		int count = argc >= 6 ? atoi(argv[5]) : 1;
+		int delay_ms = argc >= 7 ? atoi(argv[6]) : 40;
+		wheel((Window)strtoul(argv[2], NULL, 0), argv[3],
+		      (unsigned int)atoi(argv[4]), count, delay_ms);
 	} else if (!strcmp(cmd, "select") && (argc == 11 || argc == 12)) {
 		Window w = (Window)strtoul(argv[2], NULL, 0);
 		select_text(w, atoi(argv[3]), atoi(argv[4]), atoi(argv[5]),

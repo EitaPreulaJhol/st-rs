@@ -131,13 +131,20 @@ The default sequence is ESC CR, which many editor and chat programs treat as
 ``insert a newline'' instead of submitting.
 .TP
 .B Ctrl-Home / Ctrl-End
+Send the modified Home/End key to the application (ESC [ 7 ^ and ESC [ 8 ^,
+the rxvt encodings).  Full-screen programs use these to jump to the beginning
+or end of their own transcript.
+.TP
+.B Shift-Home / Shift-End
 Jump to the oldest line in the scrollback / return to the live screen.
 .TP
 .B Shift-Page Up / Shift-Page Down
 Scroll the history by one page.
 .TP
-.B Shift-MouseWheelUp / Shift-MouseWheelDown
-Scroll the history by one line.
+.B MouseWheelUp / MouseWheelDown
+Scroll the history by one line on the main screen.  This works with or
+without Shift.  On the alternate screen the wheel is forwarded to the
+application, which can use it to scroll its own view.
 .TP
 .B Break
 Send a break in the serial line.

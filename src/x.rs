@@ -303,7 +303,15 @@ impl App {
             self.buttons |= 1 << (btn - 1);
         }
 
-        if self.win_is_set(MODE_MOUSE) && e.state & config::FORCEMOUSEMOD == 0 {
+        // On the alternate screen the wheel belongs to the application:
+        // scrollback can only show the hidden main screen there.  Even the
+        // force-mouse modifier must not take the wheel away from full-screen
+        // programs (they use it to scroll their own transcript).
+        let wheel = btn == Button4 || btn == Button5;
+        let forced = e.state & config::FORCEMOUSEMOD != 0;
+        if self.win_is_set(MODE_MOUSE)
+            && (!forced || (wheel && self.is_set(MODE_ALTSCREEN)))
+        {
             self.mousereport(ev);
             return;
         }
@@ -342,7 +350,11 @@ impl App {
             self.buttons &= !(1 << (btn - 1));
         }
 
-        if self.win_is_set(MODE_MOUSE) && e.state & config::FORCEMOUSEMOD == 0 {
+        let wheel = btn == Button4 || btn == Button5;
+        let forced = e.state & config::FORCEMOUSEMOD != 0;
+        if self.win_is_set(MODE_MOUSE)
+            && (!forced || (wheel && self.is_set(MODE_ALTSCREEN)))
+        {
             self.mousereport(ev);
             return;
         }
@@ -391,9 +403,13 @@ impl App {
             return true;
         }
 
+        let altscreen = self.is_set(MODE_ALTSCREEN);
         for ms in config::MSHORTCUTS {
             if ms.release == release
                 && ms.button == e.button
+                && (ms.altscrn == 0
+                    || (ms.altscrn > 0 && altscreen)
+                    || (ms.altscrn < 0 && !altscreen))
                 && (self.match_mask(ms.mask, state)
                     || self.match_mask(ms.mask, state & !config::FORCEMOUSEMOD))
             {
@@ -3151,8 +3167,10 @@ mod tests {
         assert_eq!(app.hotkey(ret, ShiftMask), Some(&b"\x1b\r"[..]));
         assert_eq!(app.hotkey(kp_enter, ShiftMask), Some(&b"\x1b\r"[..]));
 
-        // Ctrl+End is a scrollback shortcut now, not a byte hotkey.
-        assert_eq!(app.hotkey(end, ControlMask), None);
+        // Ctrl+Home/End are application keys encoded as rxvt-style sequences.
+        let home = x11::keysym::XK_Home as KeySym;
+        assert_eq!(app.hotkey(home, ControlMask), Some(&b"\x1b[7^"[..]));
+        assert_eq!(app.hotkey(end, ControlMask), Some(&b"\x1b[8^"[..]));
 
         // The modifiers must match exactly, apart from the ignored ones.
         assert_eq!(app.hotkey(ret, 0), None);
