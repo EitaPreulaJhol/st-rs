@@ -4,8 +4,8 @@ A faithful Rust port of [st](https://st.suckless.org/) 0.9.3, the suckless
 simple terminal for X.
 
 The emulator behaves like the original: the same escape-sequence parser,
-screen/selection model, pty handling, X11 rendering through Xft. I've added
-some modifications based on what I felt that was missing.
+screen/selection model, pty handling, X11 rendering through Xft, etc. I've 
+added some modifications based on what I felt was missing.
 
 ## Requirements
 
