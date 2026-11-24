@@ -2421,6 +2421,17 @@ impl App {
         mask == config::XK_ANY_MOD || mask == (state & !config::IGNOREMOD)
     }
 
+    /// Bytes configured in `HOTKEYS` for this key event, if any.
+    ///
+    /// Caps Lock is ignored, so e.g. Shift+Enter keeps working with it on.
+    pub fn hotkey(&self, k: KeySym, state: u32) -> Option<&'static [u8]> {
+        let state = state & !(config::IGNOREMOD | LockMask);
+        config::HOTKEYS
+            .iter()
+            .find(|hk| hk.keysym == k && (hk.mask == config::XK_ANY_MOD || hk.mask == state))
+            .map(|hk| hk.seq)
+    }
+
     pub fn kmap(&self, k: KeySym, state: u32) -> Option<&'static [u8]> {
         let mut i = 0usize;
         while i < config::MAPPEDKEYS.len() {
@@ -2502,7 +2513,13 @@ impl App {
             self.highlighturls();
         }
 
-        // 1. shortcuts
+        // 1. user-defined hotkeys (they may override the built-in bindings)
+        if let Some(seq) = self.hotkey(ksym, e.state) {
+            self.ttywrite(seq, true);
+            return;
+        }
+
+        // 2. shortcuts
         for bp in config::SHORTCUTS {
             if ksym == bp.keysym && self.match_mask(bp.mask, e.state) {
                 (bp.func)(self, &bp.arg);
@@ -2510,13 +2527,13 @@ impl App {
             }
         }
 
-        // 2. custom keys from config
+        // 3. custom keys from config
         if let Some(customkey) = self.kmap(ksym, e.state) {
             self.ttywrite(customkey, true);
             return;
         }
 
-        // 3. composed string from input method
+        // 4. composed string from input method
         if len == 0 {
             return;
         }
@@ -3122,6 +3139,29 @@ mod tests {
         assert_eq!(hex_to_int(b'F'), Some(15));
         assert_eq!(hex_to_int(b'g'), None);
         assert_eq!(hex_to_int(b'/'), None);
+    }
+
+    #[test]
+    fn configured_hotkeys_are_matched() {
+        let app = App::new(Options::default());
+        let ret = x11::keysym::XK_Return as KeySym;
+        let kp_enter = x11::keysym::XK_KP_Enter as KeySym;
+        let end = x11::keysym::XK_End as KeySym;
+
+        assert_eq!(app.hotkey(ret, ShiftMask), Some(&b"\x1b\r"[..]));
+        assert_eq!(app.hotkey(kp_enter, ShiftMask), Some(&b"\x1b\r"[..]));
+
+        // Ctrl+End is a scrollback shortcut now, not a byte hotkey.
+        assert_eq!(app.hotkey(end, ControlMask), None);
+
+        // The modifiers must match exactly, apart from the ignored ones.
+        assert_eq!(app.hotkey(ret, 0), None);
+        assert_eq!(app.hotkey(end, 0), None);
+        assert_eq!(app.hotkey(end, ControlMask | ShiftMask), None);
+        assert_eq!(
+            app.hotkey(ret, ShiftMask | LockMask),
+            Some(&b"\x1b\r"[..])
+        );
     }
 
     #[test]

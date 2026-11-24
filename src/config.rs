@@ -83,6 +83,10 @@ pub const BELLVOLUME: i32 = 0;
 pub const TERMNAME: &str = "st-256color";
 pub const TABSPACES: u32 = 8;
 
+/// Maximum number of lines kept in the scrollback buffer.  Set to 0 to
+/// disable scrollback (history is still harmless, just never filled).
+pub const SCROLLBACK: usize = 10000;
+
 /// Opacity of the default background (0.0 transparent, 1.0 opaque).
 /// Only visible with a compositing manager.
 pub const ALPHA: f32 = 0.8;
@@ -234,6 +238,16 @@ pub struct MouseShortcut {
     pub func: fn(&mut App, &Arg),
     pub arg: Arg,
     pub release: bool,
+}
+
+/// A user-defined key binding that sends a byte sequence to the terminal.
+///
+/// Hotkeys are checked before `SHORTCUTS` and `KEY`, so an entry here
+/// overrides the default binding for the same key combination.
+pub struct Hotkey {
+    pub mask: u32,
+    pub keysym: u64,
+    pub seq: &'static [u8],
 }
 
 pub struct Key {
@@ -1720,6 +1734,22 @@ pub const IGNOREMOD: u32 = Mod2Mask | XK_SWITCH_MOD;
 
 /// Internal mouse shortcuts.
 pub static MSHORTCUTS: &[MouseShortcut] = &[
+    // Shift+wheel scrolls the terminal's own history instead of sending the
+    // usual cursor-key sequences to the application.
+    MouseShortcut {
+        mask: ShiftMask,
+        button: Button4,
+        func: App::kscrollup,
+        arg: Arg::i(1),
+        release: false,
+    },
+    MouseShortcut {
+        mask: ShiftMask,
+        button: Button5,
+        func: App::kscrolldown,
+        arg: Arg::i(1),
+        release: false,
+    },
     MouseShortcut {
         mask: XK_ANY_MOD,
         button: Button2,
@@ -1757,6 +1787,29 @@ pub static MSHORTCUTS: &[MouseShortcut] = &[
     },
 ];
 
+/// User-defined hotkeys, checked before `SHORTCUTS` and `KEY`.
+///
+/// Each entry sends `seq` to the foreground program when the key event has
+/// exactly `mask` modifiers (ignoring `IGNOREMOD` and Caps Lock) and the
+/// `keysym`.
+/// `XK_ANY_MOD` matches any modifier combination.  Masks combine with `|`,
+/// e.g. `ControlMask | ShiftMask`.
+pub static HOTKEYS: &[Hotkey] = &[
+    // Shift+Enter: send ESC CR, which most TUI editors and chat clients
+    // (including Claude Code) treat as "insert a newline" rather than
+    // "submit".  Use b"\n" instead if your program wants a bare line feed.
+    Hotkey {
+        mask: ShiftMask,
+        keysym: x11::keysym::XK_Return as u64,
+        seq: b"\x1b\r",
+    },
+    Hotkey {
+        mask: ShiftMask,
+        keysym: x11::keysym::XK_KP_Enter as u64,
+        seq: b"\x1b\r",
+    },
+];
+
 /// Internal keyboard shortcuts.
 pub static SHORTCUTS: &[Shortcut] = &[
     Shortcut {
@@ -1782,6 +1835,33 @@ pub static SHORTCUTS: &[Shortcut] = &[
         keysym: x11::keysym::XK_Print as u64,
         func: App::printsel,
         arg: Arg::i(0),
+    },
+    // Scrollback: Shift+PageUp/PageDown scroll by a page, Ctrl+Home/End jump
+    // to the oldest/newest line.  They are checked before `KEY`, so they no
+    // longer send the default PageUp/PageDown/Home/End sequences.
+    Shortcut {
+        mask: ShiftMask,
+        keysym: x11::keysym::XK_Prior as u64,
+        func: App::kscrollup,
+        arg: Arg::i(-1),
+    },
+    Shortcut {
+        mask: ShiftMask,
+        keysym: x11::keysym::XK_Next as u64,
+        func: App::kscrolldown,
+        arg: Arg::i(-1),
+    },
+    Shortcut {
+        mask: ControlMask,
+        keysym: x11::keysym::XK_Home as u64,
+        func: App::kscrollup,
+        arg: Arg::i(i32::MAX),
+    },
+    Shortcut {
+        mask: ControlMask,
+        keysym: x11::keysym::XK_End as u64,
+        func: App::kscrolldown,
+        arg: Arg::i(i32::MAX),
     },
     Shortcut {
         mask: (ControlMask | ShiftMask),

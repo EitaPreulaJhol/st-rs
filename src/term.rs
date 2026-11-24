@@ -197,12 +197,36 @@ impl App {
         self.sel.ob.x = -1;
     }
 
+    /// The line displayed at screen row `y`, honoring the scrollback view.
+    pub fn tline(&self, y: i32) -> &Line {
+        let scr = self.term.scr as isize;
+        let y = y as isize;
+        if y < scr {
+            let idx = self.term.hist.len() as isize - scr + y;
+            &self.term.hist[idx as usize]
+        } else {
+            &self.term.line[(y - scr) as usize]
+        }
+    }
+
+    fn tline_mut(&mut self, y: i32) -> &mut Line {
+        let scr = self.term.scr as isize;
+        let y = y as isize;
+        if y < scr {
+            let idx = self.term.hist.len() as isize - scr + y;
+            &mut self.term.hist[idx as usize]
+        } else {
+            &mut self.term.line[(y - scr) as usize]
+        }
+    }
+
     pub fn tlinelen(&self, y: i32) -> i32 {
+        let line = self.tline(y);
         let mut i = self.term.col;
-        if self.term.line[y as usize][(i - 1) as usize].mode & ATTR_WRAP != 0 {
+        if line[(i - 1) as usize].mode & ATTR_WRAP != 0 {
             return i;
         }
-        while i > 0 && self.term.line[y as usize][(i - 1) as usize].u == b' ' as Rune {
+        while i > 0 && line[(i - 1) as usize].u == b' ' as Rune {
             i -= 1;
         }
         i
@@ -322,7 +346,7 @@ impl App {
     fn selsnap(&mut self, x: &mut i32, y: &mut i32, direction: i32) {
         match self.sel.snap {
             SNAP_WORD => {
-                let mut prevgp = self.term.line[*y as usize][*x as usize];
+                let mut prevgp = self.tline(*y)[*x as usize];
                 let mut prevdelim = is_delim(prevgp.u);
                 loop {
                     let mut newx = *x + direction;
@@ -339,7 +363,7 @@ impl App {
                         } else {
                             (newy, newx)
                         };
-                        if self.term.line[yt as usize][xt as usize].mode & ATTR_WRAP == 0 {
+                        if self.tline(yt)[xt as usize].mode & ATTR_WRAP == 0 {
                             break;
                         }
                     }
@@ -348,7 +372,7 @@ impl App {
                         break;
                     }
 
-                    let gp = self.term.line[newy as usize][newx as usize];
+                    let gp = self.tline(newy)[newx as usize];
                     let delim = is_delim(gp.u);
                     if gp.mode & ATTR_WDUMMY == 0
                         && (delim != prevdelim || (delim && gp.u != prevgp.u))
@@ -366,20 +390,14 @@ impl App {
                 *x = if direction < 0 { 0 } else { self.term.col - 1 };
                 if direction < 0 {
                     while *y > 0 {
-                        if self.term.line[(*y - 1) as usize][(self.term.col - 1) as usize].mode
-                            & ATTR_WRAP
-                            == 0
-                        {
+                        if self.tline(*y - 1)[(self.term.col - 1) as usize].mode & ATTR_WRAP == 0 {
                             break;
                         }
                         *y += direction;
                     }
                 } else if direction > 0 {
                     while *y < self.term.row - 1 {
-                        if self.term.line[*y as usize][(self.term.col - 1) as usize].mode
-                            & ATTR_WRAP
-                            == 0
-                        {
+                        if self.tline(*y)[(self.term.col - 1) as usize].mode & ATTR_WRAP == 0 {
                             break;
                         }
                         *y += direction;
@@ -428,7 +446,7 @@ impl App {
                 )
             };
             let mut last = min(lastx, linelen - 1);
-            let line = &self.term.line[y as usize];
+            let line = self.tline(y);
             while last >= gp && line[last as usize].u == b' ' as Rune {
                 last -= 1;
             }
@@ -495,7 +513,7 @@ impl App {
     fn rowbytes(&self, row: i32) -> Vec<u8> {
         let col = self.term.col as usize;
         let mut buf = vec![0u8; col + 1];
-        for (j, g) in self.term.line[row as usize].iter().take(col).enumerate() {
+        for (j, g) in self.tline(row).iter().take(col).enumerate() {
             if g.u > 0 && g.u < 127 {
                 buf[j] = g.u as u8;
             }
@@ -555,12 +573,15 @@ impl App {
                 continue;
             }
             let mut changed = false;
-            for (start, end) in spans {
-                for c in start..end {
-                    let g = &mut self.term.line[row as usize][c as usize];
-                    if g.mode & ATTR_URL == 0 {
-                        g.mode |= ATTR_URL;
-                        changed = true;
+            {
+                let line = self.tline_mut(row);
+                for (start, end) in spans {
+                    for c in start..end {
+                        let g = &mut line[c as usize];
+                        if g.mode & ATTR_URL == 0 {
+                            g.mode |= ATTR_URL;
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -572,19 +593,20 @@ impl App {
 
     /// Remove the underlines added by [`App::highlighturls`].
     pub fn unhighlighturls(&mut self) {
-        let col = self.term.col as usize;
-        for row in 0..self.term.row {
-            let line = &mut self.term.line[row as usize];
-            let mut changed = false;
-            for g in line.iter_mut().take(col) {
+        let mut changed = false;
+        // Clear both the live screen and the history: the view may have moved
+        // while Ctrl was held, leaving underlines on rows that are no longer
+        // visible.
+        for line in self.term.line.iter_mut().chain(self.term.hist.iter_mut()) {
+            for g in line.iter_mut() {
                 if g.mode & ATTR_URL != 0 {
                     g.mode &= !ATTR_URL;
                     changed = true;
                 }
             }
-            if changed {
-                self.tsetdirt(row, row);
-            }
+        }
+        if changed {
+            self.tfulldirt();
         }
     }
 
@@ -850,6 +872,11 @@ impl App {
     }
 
     pub fn ttywrite(&mut self, s: &[u8], may_echo: bool) {
+        // Sending input returns to the live screen, like other terminals.
+        if self.term.scr != 0 {
+            self.kscrolldown(&Arg::i(i32::MAX));
+        }
+
         if may_echo && self.is_set(MODE_ECHO) {
             self.twrite(s, s.len() as i32, true);
         }
@@ -1066,11 +1093,69 @@ impl App {
     pub fn tswapscreen(&mut self) {
         std::mem::swap(&mut self.term.line, &mut self.term.alt);
         self.term.mode ^= MODE_ALTSCREEN;
+        self.term.scr = 0;
         self.tfulldirt();
+    }
+
+    /// Append a line that just left the top of the main screen.
+    fn histpush(&mut self, line: Line) {
+        if config::SCROLLBACK == 0 {
+            return;
+        }
+        self.term.hist.push_back(line);
+        while self.term.hist.len() > config::SCROLLBACK {
+            self.term.hist.pop_front();
+        }
+        // Keep the displayed history stable while new output arrives.
+        if self.term.scr > 0 {
+            self.term.scr = min(self.term.scr + 1, self.term.hist.len() as i32);
+        }
+    }
+
+    /// Scroll the viewport up (towards older lines).  `Arg::i(-1)` scrolls a
+    /// page; a large positive value goes to the oldest line.
+    pub fn kscrollup(&mut self, arg: &Arg) {
+        if self.is_set(MODE_ALTSCREEN) {
+            return;
+        }
+        let mut n = match arg.0 {
+            ArgVal::I(n) => n,
+            _ => 1,
+        };
+        if n < 0 {
+            n += self.term.row;
+        }
+        let room = self.term.hist.len() as i32 - self.term.scr;
+        let n = limit(n, 0, room.max(0));
+        if n > 0 {
+            self.term.scr += n;
+            self.selscroll(0, n);
+            self.tfulldirt();
+        }
+    }
+
+    /// Scroll the viewport down (towards the live screen).
+    pub fn kscrolldown(&mut self, arg: &Arg) {
+        let mut n = match arg.0 {
+            ArgVal::I(n) => n,
+            _ => 1,
+        };
+        if n < 0 {
+            n += self.term.row;
+        }
+        let n = limit(n, 0, self.term.scr);
+        if n > 0 {
+            self.term.scr -= n;
+            self.selscroll(0, -n);
+            self.tfulldirt();
+        }
     }
 
     pub fn tscrolldown(&mut self, orig: i32, n: i32) {
         let n = limit(n, 0, self.term.bot - orig + 1);
+        if n == 0 {
+            return;
+        }
         self.tsetdirt(orig, self.term.bot - n);
         self.tclearregion(0, self.term.bot - n + 1, self.term.col - 1, self.term.bot);
 
@@ -1078,11 +1163,29 @@ impl App {
             self.term.line.swap(i as usize, (i - n) as usize);
         }
 
-        self.selscroll(orig, n);
+        if self.term.scr == 0 {
+            self.selscroll(orig, n);
+        }
     }
 
-    pub fn tscrollup(&mut self, orig: i32, n: i32) {
+    pub fn tscrollup(&mut self, orig: i32, n: i32, record: bool) {
         let n = limit(n, 0, self.term.bot - orig + 1);
+        if n == 0 {
+            return;
+        }
+
+        if record
+            && !self.is_set(MODE_ALTSCREEN)
+            && orig == 0
+            && self.term.top == 0
+            && self.term.bot == self.term.row - 1
+        {
+            for i in 0..n {
+                let line = self.term.line[i as usize].clone();
+                self.histpush(line);
+            }
+        }
+
         self.tclearregion(0, orig, self.term.col - 1, orig + n - 1);
         self.tsetdirt(orig + n, self.term.bot);
 
@@ -1090,7 +1193,9 @@ impl App {
             self.term.line.swap(i as usize, (i + n) as usize);
         }
 
-        self.selscroll(orig, -n);
+        if self.term.scr == 0 {
+            self.selscroll(orig, -n);
+        }
     }
 
     pub fn selscroll(&mut self, orig: i32, n: i32) {
@@ -1120,7 +1225,7 @@ impl App {
     pub fn tnewline(&mut self, first_col: bool) {
         let mut y = self.term.c.y;
         if y == self.term.bot {
-            self.tscrollup(self.term.top, 1);
+            self.tscrollup(self.term.top, 1, true);
         } else {
             y += 1;
         }
@@ -1192,7 +1297,7 @@ impl App {
         for y in y1..=y2 {
             self.term.dirty[y as usize] = true;
             for x in x1..=x2 {
-                if self.selected(x, y) {
+                if self.term.scr == 0 && self.selected(x, y) {
                     self.selclear();
                 }
                 let gp = &mut self.term.line[y as usize][x as usize];
@@ -1237,7 +1342,7 @@ impl App {
 
     pub fn tdeleteline(&mut self, n: i32) {
         if between(self.term.c.y, self.term.top, self.term.bot) {
-            self.tscrollup(self.term.c.y, n);
+            self.tscrollup(self.term.c.y, n, false);
         }
     }
 }
@@ -1762,7 +1867,7 @@ impl App {
                 // SU
                 if !priv_ {
                     let n = if arg0 == 0 { 1 } else { arg0 };
-                    self.tscrollup(self.term.top, n);
+                    self.tscrollup(self.term.top, n, false);
                 }
             }
             b'T' => {
@@ -2212,7 +2317,7 @@ impl App {
             0x44 => {
                 // IND
                 if self.term.c.y == self.term.bot {
-                    self.tscrollup(self.term.top, 1);
+                    self.tscrollup(self.term.top, 1, true);
                 } else {
                     self.tmoveto(self.term.c.x, self.term.c.y + 1);
                 }
@@ -2339,7 +2444,7 @@ impl App {
             return;
         }
 
-        if self.selected(self.term.c.x, self.term.c.y) {
+        if self.term.scr == 0 && self.selected(self.term.c.x, self.term.c.y) {
             self.selclear();
         }
 
@@ -2441,6 +2546,13 @@ impl App {
             0
         };
         if shift > 0 && shift <= self.term.line.len() {
+            // Rows lost above the cursor on the main screen become history.
+            if !self.is_set(MODE_ALTSCREEN) {
+                for i in 0..shift {
+                    let line = self.term.line[i].clone();
+                    self.histpush(line);
+                }
+            }
             self.term.line.drain(0..shift);
             self.term.alt.drain(0..shift);
         }
@@ -2459,6 +2571,18 @@ impl App {
         for i in minrow as usize..row as usize {
             self.term.line[i] = vec![Glyph::default(); col as usize];
             self.term.alt[i] = vec![Glyph::default(); col as usize];
+        }
+
+        // History lines follow the new width too, so scrolling back after a
+        // resize never indexes a short line.
+        let blank = Glyph {
+            u: b' ' as Rune,
+            fg: self.term.c.attr.fg,
+            bg: self.term.c.attr.bg,
+            mode: ATTR_NULL,
+        };
+        for line in self.term.hist.iter_mut() {
+            line.resize(col as usize, blank);
         }
 
         if col > self.term.col {
@@ -2485,6 +2609,7 @@ impl App {
 
         self.term.col = col;
         self.term.row = row;
+        self.term.scr = limit(self.term.scr, 0, self.term.hist.len() as i32);
 
         // A selection whose bounds no longer fit must not survive: later
         // selection code (and the C original) would index retired rows.
@@ -2559,14 +2684,16 @@ impl App {
         let len = min(self.tlinelen(n), self.term.col);
         if len > 0 {
             let last = (len - 1) as usize;
-            let first = self.term.line[n as usize][0];
+            let line = self.tline(n);
+            let first = line[0];
             if !(last == 0 && first.u == b' ' as Rune) {
+                let mut out = Vec::new();
                 let mut buf = [0u8; UTF_SIZ];
-                for i in 0..=last {
-                    let u = self.term.line[n as usize][i].u;
-                    let sz = utf8encode(u, &mut buf);
-                    self.tprinter(&buf[..sz]);
+                for glyph in line.iter().take(last + 1) {
+                    let sz = utf8encode(glyph.u, &mut buf);
+                    out.extend_from_slice(&buf[..sz]);
                 }
+                self.tprinter(&out);
             }
         }
         self.tprinter(b"\n");
@@ -2643,7 +2770,7 @@ impl App {
                 continue;
             }
             self.term.dirty[y as usize] = false;
-            let line = self.term.line[y as usize].clone();
+            let line = self.tline(y).clone();
             self.xdrawline(&line, x1, y, x2);
         }
     }
@@ -2657,6 +2784,12 @@ impl App {
             return;
         }
 
+        // While viewing history, all visible rows depend on the offset; a
+        // normal dirty-row update would mark the wrong screen rows.
+        if self.term.scr != 0 {
+            self.tfulldirt();
+        }
+
         self.term.ocx = limit(ocx, 0, self.term.col - 1);
         self.term.ocy = limit(ocy, 0, self.term.row - 1);
         if self.term.line[self.term.ocy as usize][self.term.ocx as usize].mode & ATTR_WDUMMY != 0 {
@@ -2667,9 +2800,11 @@ impl App {
         }
 
         self.drawregion(0, 0, self.term.col, self.term.row);
-        let g = self.term.line[self.term.c.y as usize][cx as usize];
-        let og = self.term.line[self.term.ocy as usize][self.term.ocx as usize];
-        self.xdrawcursor(cx, self.term.c.y, g, self.term.ocx, self.term.ocy, og);
+        if self.term.scr == 0 {
+            let g = self.term.line[self.term.c.y as usize][cx as usize];
+            let og = self.term.line[self.term.ocy as usize][self.term.ocx as usize];
+            self.xdrawcursor(cx, self.term.c.y, g, self.term.ocx, self.term.ocy, og);
+        }
         self.term.ocx = cx;
         self.term.ocy = self.term.c.y;
         self.xfinishdraw();
@@ -2731,6 +2866,11 @@ mod tests {
 
     fn cell(app: &App, x: i32, y: i32) -> Glyph {
         app.term.line[y as usize][x as usize]
+    }
+
+    fn row_text(app: &App, y: i32) -> String {
+        let len = app.tlinelen(y) as usize;
+        app.tline(y)[..len].iter().map(|g| g.u as u8 as char).collect()
     }
 
     #[test]
@@ -2853,6 +2993,82 @@ mod tests {
         assert_eq!(cell(&app, 0, 0).u, 'b' as Rune);
         assert_eq!(cell(&app, 0, 1).u, 'c' as Rune);
         assert_eq!(cell(&app, 0, 2).u, 'd' as Rune);
+    }
+
+    #[test]
+    fn scrollback_history_and_view() {
+        let mut app = new_app(10, 3);
+        feed(&mut app, b"one\r\ntwo\r\nthree\r\nfour\r\n");
+
+        assert_eq!(app.term.hist.len(), 2);
+        assert_eq!(row_text(&app, 0), "three");
+        assert_eq!(row_text(&app, 1), "four");
+
+        app.kscrollup(&Arg::i(1));
+        assert_eq!(app.term.scr, 1);
+        assert_eq!(row_text(&app, 0), "two");
+        assert_eq!(row_text(&app, 1), "three");
+        assert_eq!(row_text(&app, 2), "four");
+
+        app.kscrollup(&Arg::i(1));
+        assert_eq!(row_text(&app, 0), "one");
+        app.kscrollup(&Arg::i(1)); // clamped at the oldest line
+        assert_eq!(app.term.scr, 2);
+
+        app.kscrolldown(&Arg::i(-1)); // one page down
+        assert_eq!(app.term.scr, 0);
+        assert_eq!(row_text(&app, 0), "three");
+
+        // New output must not move the view while it is scrolled back.
+        app.kscrollup(&Arg::i(2));
+        feed(&mut app, b"five\r\n");
+        assert_eq!(app.term.scr, 3);
+        assert_eq!(row_text(&app, 0), "one");
+        assert_eq!(row_text(&app, 1), "two");
+        assert_eq!(row_text(&app, 2), "three");
+
+        // History lines follow a width change.
+        app.tresize(5, 3);
+        assert_eq!(app.term.hist.len(), 3);
+        for line in &app.term.hist {
+            assert_eq!(line.len(), 5);
+        }
+    }
+
+    #[test]
+    fn scrollback_ignores_alt_screen() {
+        let mut app = new_app(10, 3);
+        feed(&mut app, b"a\r\nb\r\nc\r\nd\r\n");
+        let histlen = app.term.hist.len();
+        assert_eq!(histlen, 2);
+
+        app.kscrollup(&Arg::i(1));
+        assert_eq!(app.term.scr, 1);
+
+        feed(&mut app, b"\x1b[?1049h");
+        assert_eq!(app.term.scr, 0);
+        feed(&mut app, b"x\r\ny\r\nz\r\nw\r\n");
+        assert_eq!(app.term.hist.len(), histlen);
+        app.kscrollup(&Arg::i(1));
+        assert_eq!(app.term.scr, 0);
+
+        feed(&mut app, b"\x1b[?1049l");
+        assert_eq!(app.term.hist.len(), histlen);
+        assert_eq!(row_text(&app, 0), "c");
+        assert_eq!(row_text(&app, 1), "d");
+    }
+
+    #[test]
+    fn scrollback_selection() {
+        let mut app = new_app(10, 3);
+        feed(&mut app, b"one\r\ntwo\r\nthree\r\n");
+        app.kscrollup(&Arg::i(2));
+
+        app.selinit();
+        app.selstart(0, 0, 0);
+        app.selextend(2, 0, SEL_REGULAR, false);
+        app.selextend(2, 0, SEL_REGULAR, true);
+        assert_eq!(app.getsel().unwrap(), b"one");
     }
 
     #[test]

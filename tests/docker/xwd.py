@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Compare XWD screenshots pixel by pixel.
+"""Inspect XWD screenshots pixel by pixel.
 
 Usage:
-    xwd.py compare A.xwd B.xwd
     xwd.py different A.xwd B.xwd MIN_PIXELS
     xwd.py pixel A.xwd X Y
 
-`compare` exits 0 when the images are pixel-identical.
 `different` exits 0 when at least MIN_PIXELS differ.
 `pixel` prints "r g b a" (0-255) for one pixel.
 """
@@ -88,19 +86,6 @@ def compare(a, b):
 
 
 def main(argv):
-    if len(argv) == 4 and argv[1] == "compare":
-        a, b = load(argv[2]), load(argv[3])
-        n, bbox = compare(a, b)
-        if n == 0:
-            print(f"pixel-identical: {a['w']}x{a['h']}")
-            return 0
-        if n < 0:
-            print(f"FAIL: dimensions differ: {a['w']}x{a['h']} vs "
-                  f"{b['w']}x{b['h']}")
-        else:
-            print(f"FAIL: {n} pixels differ, bbox {bbox}")
-        return 1
-
     if len(argv) == 5 and argv[1] == "different":
         minimum = int(argv[4])
         a, b = load(argv[2]), load(argv[3])

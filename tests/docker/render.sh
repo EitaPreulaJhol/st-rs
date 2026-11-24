@@ -1,5 +1,5 @@
 #!/bin/sh
-# Render a deterministic set of attributes; used for pixel comparisons.
+# Render a deterministic set of attributes for the rendering smoke test.
 # Usage: render.sh DIR TAG [SECONDS]
 
 dir=$1
@@ -9,12 +9,11 @@ delay=${3:-4}
 echo "$WINDOWID" > "$dir/wid_$tag"
 stty size > "$dir/size_$tag"
 
-# Steady block cursor: screenshots are compared against a reference build, so
-# the blink phase of the cursor must not influence them.
+# Steady block cursor: the blink phase must not influence screenshots.
 printf '\033[2 q'
 
-# Normalise the palette so the screenshots compare terminal behaviour rather
-# than the colour scheme compiled into each build.
+# Normalise the palette so the screenshot shows terminal behaviour rather
+# than the configured colour scheme.
 colors='383a42 e45649 50a14f c18401 0184bc a626a4 0997b3 a0a1a7
 4f525e e06c75 98c379 e5c07b 61afef c678dd 56b6c2 ffffff'
 i=0

@@ -50,8 +50,8 @@ Edit it and rebuild (`cargo build --release` or `make`). A pristine copy of the
 defaults is kept in `config.def.rs`; restore them with
 `cp config.def.rs src/config.rs`.
 
-The key/mouse/shortcut tables are static arrays, just like the C version, so
-adding a binding is a matter of appending an entry.
+The key/mouse/shortcut/hotkey tables are static arrays, just like the C
+version, so adding a binding is a matter of appending an entry.
 
 ### Fonts and runtime zoom
 		
@@ -82,6 +82,51 @@ At runtime:
 The zoom step and limits are `FONT_SIZE_STEP`, `FONT_SIZE_MIN` and
 `FONT_SIZE_MAX` in `src/config.rs`. Remove or edit the corresponding `SHORTCUTS`
 entries if you prefer those keys to reach applications.
+
+### Hotkeys
+
+`HOTKEYS` in `src/config.rs` maps key combinations to byte sequences that are
+sent to the foreground program. Entries are checked before `SHORTCUTS` and the
+`KEY` table, so they override the default binding for the same combination.
+The default table adds one common terminal hotkey:
+
+```rust
+pub static HOTKEYS: &[Hotkey] = &[
+    // Shift+Enter: newline (ESC CR) instead of submitting the line.
+    Hotkey {
+        mask: ShiftMask,
+        keysym: x11::keysym::XK_Return as u64,
+        seq: b"\x1b\r",
+    },
+];
+```
+
+Keypad Enter is bound the same way. `mask` is an X11 modifier mask
+(`ShiftMask`, `ControlMask`, `Mod1Mask`, ...; combine them with `|`, or use
+`XK_ANY_MOD` for any modifiers) and `keysym` is the X11 keysym. NumLock and
+Caps Lock do not affect hotkeys. Change `seq` to what your program expects: for
+example, some editors want a bare `b"\n"` for Shift+Enter. Bindings that call
+st's own actions (copy, paste, zoom, scrollback, ...) belong in `SHORTCUTS`;
+hotkeys only send bytes. Comment out an entry to restore the original st
+mapping.
+
+### Scrollback
+
+The main screen keeps up to `SCROLLBACK` lines of history (10000 by default;
+set it to 0 to disable it). Lines are saved when they scroll off the top of
+the full-screen main buffer; the alternate screen is not saved. Default
+controls:
+
+* `Shift+PageUp` / `Shift+PageDown` scroll by a page.
+* `Ctrl+Home` / `Ctrl+End` jump to the oldest line / back to the live screen.
+* `Shift+MouseWheelUp` / `Shift+MouseWheelDown` scroll line by line.
+* Any input, paste or mouse report returns to the live screen.
+
+Scrolling only changes the view: the terminal keeps parsing output and the
+live screen keeps updating. Selection and copying, URL clicking, and the
+print-screen shortcut use the viewed lines, so text from history can be
+selected and copied. The cursor is hidden while scrolled back. Resizing
+re-wraps history by truncating or padding lines; it does not reflow text.
 
 ### Colours
 
@@ -175,7 +220,6 @@ Compose v2 are required.
 
 ```sh
 make test                     # build the test image if needed and run everything
-ST_FUZZ_CASES=200 make test   # longer differential fuzz run
 make test-local               # only the Rust unit tests, on the host
 make test-clean               # drop the cached Cargo target volume
 ```
@@ -188,29 +232,24 @@ The suite covers:
 
 * Rust unit tests: UTF-8 encode/decode (including malformed input), base64,
   text output, wrapping, wide characters, tabs, scrolling, alternate screen,
-  erase modes, SGR/256/true colour, selection snapping/rectangular/wrapped
-  selections, resize fuzzing, and selections surviving (or being cleared on)
-  resize.
-* Command-line compatibility: `-v` and usage output are byte-identical to the
-  C original.
-* Differential fuzzing: randomized escape-sequence streams are fed to both the
-  Rust port and the C st built from `original_source/`; their screen dumps must
-  match byte for byte.
-* Rendering: screenshots of the configured font, DejaVu Sans Mono, and a zoomed
-  terminal are compared pixel by pixel against the C original, including bold/
-  faint/italic/underline/struck/reverse/invisible attributes, palette/true
-  colour cells, DEC line drawing, wide characters and reverse video.
-* Keyboard mapping: a large set of keys and modifier combinations is sent via
-  XTest in normal and application cursor/keypad modes; the bytes received by a
-  child process must match the C implementation.
+  erase modes, SGR/256/true colour, scrollback history/viewport/selection,
+  selection snapping/rectangular/wrapped selections, resize fuzzing, and
+  selections surviving (or being cleared on) resize.
+* Rendering: screenshots of the configured font, an explicit font, and a zoomed
+  terminal exercise bold/faint/italic/underline/struck/reverse/invisible
+  attributes, palette/true colour cells, DEC line drawing, wide characters and
+  reverse video.
+* Configured hotkeys: `Shift+Enter` delivers its configured byte sequence to
+  the child process.
+* Scrollback: after 20 lines on a 5-row terminal, `Ctrl+Home` followed by
+  `Shift+PrintScreen` dumps the oldest lines, and `Ctrl+End` returns to the
+  live screen.
 * Mouse selection, PRIMARY/CLIPBOARD copy, and bracketed paste are exercised
-  end to end and compared with the C behavior.
+  end to end.
 * Runtime font zoom (Ctrl+Plus/Minus/0, Ctrl+=, Ctrl+Shift+-), clamping at the
   configured limits, and reset.
 * Custom per-style fonts: a variant is built with DejaVu bold/italic patterns,
   rendered, compared against the derived-style build, and zoomed.
-
-Set `ST_FUZZ_CASES` and `ST_FUZZ_SEED` to control the differential fuzzer.
 
 ## Source layout
 
@@ -246,6 +285,11 @@ destroy callbacks can reach the state; the rest is regular Rust ownership.
   Set `CURSORSTYLE = 2` for the original look.
 * URLs are underlined while `Ctrl` is held and opened on `Ctrl+Click`, as in the
   `clickurl` patch.
+* `Shift+Enter` is a hotkey in `HOTKEYS` (ESC CR) instead of st's default
+  `\r` mapping.
+* The main screen keeps a scrollback history; `Ctrl+Home` / `Ctrl+End` and
+  `Shift+PageUp` / `Shift+PageDown` are scrollback shortcuts instead of the
+  original key sequences. Set `SCROLLBACK = 0` to disable history.
 * Drag-and-drop follows the `drag-n-drop` patch: dropped URIs are decoded and
   shell-escaped before being pasted. XdndFinished reports success per the XDND
   specification instead of the item count.

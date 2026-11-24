@@ -6,6 +6,7 @@
 
 #![allow(non_upper_case_globals)]
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
@@ -220,6 +221,10 @@ pub struct Term {
     pub col: i32,
     pub line: Vec<Line>,
     pub alt: Vec<Line>,
+    /// Lines that scrolled off the top of the main screen, oldest first.
+    pub hist: VecDeque<Line>,
+    /// Number of history lines shown above the live screen (0 = bottom).
+    pub scr: i32,
     pub dirty: Vec<bool>,
     pub c: TCursor,
     pub ocx: i32,
@@ -248,6 +253,8 @@ impl Term {
             col: 0,
             line: Vec::new(),
             alt: Vec::new(),
+            hist: VecDeque::new(),
+            scr: 0,
             dirty: Vec::new(),
             c: TCursor::new(fg, bg),
             ocx: 0,

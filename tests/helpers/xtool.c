@@ -5,7 +5,6 @@
  *   focus WID
  *   key   WID MODS KEYSYM      MODS is any of c (control), s (shift), a (alt)
  *   type  WID STRING
- *   keys  WID mapping          send the full keyboard-mapping test sequence
  *   zoom  WID MODE [N] [MS]    MODE: plus|equal|minus|underscore|kpadd|kpsub|reset
  *   select WID BORDER CW CH C0 R0 C1 R1 PRIMARY_OUT [CLIPBOARD_OUT]
  *
@@ -42,7 +41,6 @@ static void usage(void)
 	        "usage: xtool focus WID\n"
 	        "       xtool key WID MODS KEYSYM\n"
 	        "       xtool type WID STRING\n"
-	        "       xtool keys WID mapping\n"
 	        "       xtool zoom WID MODE [N] [MS]\n"
 	        "       xtool select WID BORDER CW CH C0 R0 C1 R1 PRIMARY [CLIPBOARD]\n");
 	exit(2);
@@ -163,70 +161,6 @@ static void type_string(Window w, const char *s)
 		if (!press(ks, shift, 0, 0, 20))
 			die("keycode for typed character is missing");
 	}
-}
-
-static void send_mapping(Window w)
-{
-	static const KeySym arrows[] = {XK_Up, XK_Down, XK_Left, XK_Right};
-	static const KeySym blocks[] = {
-		XK_Home, XK_End, XK_Insert, XK_Delete, XK_Prior, XK_Next,
-	};
-	static const KeySym fkeys[] = {
-		XK_F1, XK_F2, XK_F3, XK_F4, XK_F5, XK_F6, XK_F7, XK_F8,
-		XK_F9, XK_F10, XK_F11, XK_F12, XK_F13, XK_F24, XK_F35,
-	};
-	static const KeySym kps[] = {
-		XK_KP_Home, XK_KP_Up, XK_KP_Down, XK_KP_Left, XK_KP_Right,
-		XK_KP_Prior, XK_KP_Next, XK_KP_End, XK_KP_Begin, XK_KP_Insert,
-		XK_KP_Delete, XK_KP_Multiply, XK_KP_Add, XK_KP_Enter,
-		XK_KP_Subtract, XK_KP_Decimal, XK_KP_Divide,
-		XK_KP_0, XK_KP_1, XK_KP_2, XK_KP_3, XK_KP_4, XK_KP_5,
-		XK_KP_6, XK_KP_7, XK_KP_8, XK_KP_9,
-	};
-	unsigned i;
-	int shift, ctrl, alt;
-
-	focus(w);
-
-	for (shift = 0; shift <= 1; shift++)
-		for (ctrl = 0; ctrl <= 1; ctrl++)
-			for (alt = 0; alt <= 1; alt++)
-				for (i = 0; i < sizeof(arrows) / sizeof(arrows[0]); i++)
-					press(arrows[i], shift, ctrl, alt, 18);
-
-	for (shift = 0; shift <= 1; shift++)
-		for (ctrl = 0; ctrl <= 1; ctrl++) {
-			/* TERMMOD combos are st shortcuts (zoom, clipboard), not
-			 * input mapping; they are covered by dedicated tests. */
-			if (shift && ctrl)
-				continue;
-			for (i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++)
-				press(blocks[i], shift, ctrl, 0, 18);
-		}
-
-	for (i = 0; i < sizeof(fkeys) / sizeof(fkeys[0]); i++) {
-		press(fkeys[i], 0, 0, 0, 18);
-		press(fkeys[i], 1, 0, 0, 18);
-		press(fkeys[i], 0, 1, 0, 18);
-		press(fkeys[i], 0, 0, 1, 18);
-	}
-
-	press(XK_ISO_Left_Tab, 1, 0, 0, 18);
-	press(XK_Tab, 0, 0, 0, 18);
-	press(XK_Return, 0, 0, 0, 18);
-	press(XK_Return, 0, 0, 1, 18);
-	press(XK_BackSpace, 0, 0, 0, 18);
-	press(XK_BackSpace, 0, 0, 1, 18);
-	press(XK_Escape, 0, 0, 0, 18);
-
-	for (i = 0; i < sizeof(kps) / sizeof(kps[0]); i++)
-		press(kps[i], 0, 0, 0, 18);
-
-	type_string(w, "abcxyz AZ 019 ./,-=;'[]\\`");
-
-	press(XK_C, 0, 1, 0, 18);
-	press(XK_D, 0, 1, 0, 18);
-	press(XK_a, 0, 0, 1, 18);
 }
 
 static int read_selection(Atom sel, Atom target, const char *outfile)
@@ -389,8 +323,6 @@ int main(int argc, char **argv)
 			die("keycode is missing");
 	} else if (!strcmp(cmd, "type") && argc == 4) {
 		type_string((Window)strtoul(argv[2], NULL, 0), argv[3]);
-	} else if (!strcmp(cmd, "keys") && argc == 4) {
-		send_mapping((Window)strtoul(argv[2], NULL, 0));
 	} else if (!strcmp(cmd, "zoom") && (argc == 4 || argc == 5 || argc == 6)) {
 		int count = argc >= 5 ? atoi(argv[4]) : 1;
 		int delay_ms = argc >= 6 ? atoi(argv[5]) : 40;

@@ -125,6 +125,20 @@ and all the remaining arguments are used as a command
 even without it.
 .SH SHORTCUTS
 .TP
+.B Shift-Enter
+Send a newline to the application.
+The default sequence is ESC CR, which many editor and chat programs treat as
+``insert a newline'' instead of submitting.
+.TP
+.B Ctrl-Home / Ctrl-End
+Jump to the oldest line in the scrollback / return to the live screen.
+.TP
+.B Shift-Page Up / Shift-Page Down
+Scroll the history by one page.
+.TP
+.B Shift-MouseWheelUp / Shift-MouseWheelDown
+Scroll the history by one line.
+.TP
 .B Break
 Send a break in the serial line.
 Break key is obtained in PC keyboards
@@ -163,6 +177,15 @@ Paste from the clipboard selection.
 .B st
 can be customized by creating a custom config.h and (re)compiling the source
 code. This keeps it fast, secure and simple.
+Key bindings that send byte sequences to the application are listed in
+.B HOTKEYS
+in
+.IR config.h ;
+internal actions such as copy, paste, zoom and scrollback are in
+.BR SHORTCUTS .
+The number of history lines is set by
+.B SCROLLBACK
+(0 disables scrollback).
 .SH AUTHORS
 See the LICENSE file for the authors.
 .SH LICENSE

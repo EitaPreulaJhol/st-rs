@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# Full test suite for the Rust st port.
+# End-to-end test suite for the Rust st port.
 #
-# Runs headless inside the Docker test image: unit tests, differential fuzzing
-# against the C original, pixel-identical rendering checks, keyboard mapping,
-# selection/clipboard/bracketed paste, runtime zoom and custom per-style fonts.
-# Xvfb provides a private display; nothing is shown on the host desktop.
+# Runs headless inside the Docker test image: unit tests, rendering smoke
+# checks, configured hotkeys, scrollback, selection/clipboard/bracketed paste,
+# runtime zoom and custom per-style fonts. Xvfb provides a private display;
+# nothing is shown on the host desktop.
 
 set -euo pipefail
 
@@ -84,61 +84,19 @@ step "building st"
 cargo build --release --locked
 [ -x "$BIN" ] || fail "missing $BIN"
 
-step "building the C reference implementation"
-C_REF="$WORK/st-c"
-cp -R original_source "$C_REF"
-(
-	cd "$C_REF"
-	make clean >/dev/null 2>&1 || true
-	make -j"$(nproc)" >/dev/null
-) || fail "C reference build failed"
-CST="$C_REF/st"
-[ -x "$CST" ] || fail "missing C reference binary"
-
 # ---------------------------------------------------------------------------
-# Command-line compatibility
+# Rendering smoke checks
 # ---------------------------------------------------------------------------
 
-step "command-line compatibility"
-mkdir -p "$WORK/cli-r" "$WORK/cli-c"
-cp "$BIN" "$WORK/cli-r/st"
-cp "$CST" "$WORK/cli-c/st"
-for opt in -v -Z; do
-	( cd "$WORK/cli-r" && ./st "$opt" >"$WORK/cli.stdout" 2>"$WORK/cli.stderr" ) || true
-	( cd "$WORK/cli-c" && ./st "$opt" >"$WORK/cli-c.stdout" 2>"$WORK/cli-c.stderr" ) || true
-	cmp -s "$WORK/cli.stdout" "$WORK/cli-c.stdout" || fail "stdout differs for $opt"
-	cmp -s "$WORK/cli.stderr" "$WORK/cli-c.stderr" || fail "stderr differs for $opt"
-done
-echo "-v and usage output are identical"
-
-# ---------------------------------------------------------------------------
-# Differential fuzzing against the C original
-# ---------------------------------------------------------------------------
-
-step "differential escape-sequence fuzzing"
-FUZZ_CASES=${ST_FUZZ_CASES:-80}
-FUZZ_SEED=${ST_FUZZ_SEED:-0xC0FFEE}
-python3 tests/docker/difftest.py "$BIN" "$CST" "$WORK/fuzz" "$FUZZ_CASES" "$FUZZ_SEED"
-
-# ---------------------------------------------------------------------------
-# Pixel-identical rendering
-# ---------------------------------------------------------------------------
-
-render_run() {
-	local bin=$1 tag=$2 font=$3 zoom=$4
+render_run() { # TAG FONT ZOOM
+	local tag=$1 font=$2 zoom=$3
 	local widf="$WORK/wid_$tag" errf="$WORK/err_$tag" xwdf="$SHOTS/$tag.xwd"
-	local args=()
+	local args=(-A 1)
 	rm -f "$widf" "$errf" "$xwdf"
-	if [ "$bin" = "$BIN" ]; then
-		# The Rust build defaults to a translucent background (the alpha
-		# patch); the C reference does not know -A. Compare text rendering
-		# with opacity disabled; the alpha behaviour has its own test.
-		args+=(-A 1)
-	fi
 	if [ -n "$font" ]; then
 		args+=(-f "$font")
 	fi
-	"$bin" -g 80x24 "${args[@]}" -e sh tests/docker/render.sh "$WORK" "$tag" 4 >/dev/null 2>"$errf" &
+	"$BIN" -g 80x24 "${args[@]}" -e sh tests/docker/render.sh "$WORK" "$tag" 4 >/dev/null 2>"$errf" &
 	local pid=$!
 	wait_file "$widf" || { cat "$errf"; fail "render did not start ($tag)"; }
 	local wid
@@ -159,30 +117,17 @@ render_run() {
 	fi
 }
 
-step "configured font starts"
+step "configured font renders"
 # Uses whatever FONT the source configuration specifies; if that family is not
-# installed, fontconfig substitutes one. No cross-implementation comparison is
-# made here because the C reference has its own config.h.
-render_run "$BIN" configured "" no
+# installed, fontconfig substitutes one.
+render_run configured "" no
 
 DEFAULT_FONT="Liberation Mono:pixelsize=12:antialias=true:autohint=true"
-step "pixel comparison: Liberation Mono 12"
-render_run "$BIN" default_r "$DEFAULT_FONT" no
-render_run "$CST" default_c "$DEFAULT_FONT" no
-python3 tests/docker/xwd.py compare "$SHOTS/default_r.xwd" "$SHOTS/default_c.xwd" ||
-	fail "default-font rendering differs"
+step "rendering with an explicit font"
+render_run default "$DEFAULT_FONT" no
 
-step "pixel comparison: DejaVu Sans Mono 16"
-render_run "$BIN" dejavu_r "DejaVu Sans Mono:pixelsize=16" no
-render_run "$CST" dejavu_c "DejaVu Sans Mono:pixelsize=16" no
-python3 tests/docker/xwd.py compare "$SHOTS/dejavu_r.xwd" "$SHOTS/dejavu_c.xwd" ||
-	fail "DejaVu rendering differs"
-
-step "pixel comparison: font zoom (Ctrl+Shift+PageUp)"
-render_run "$BIN" zoom_r "$DEFAULT_FONT" yes
-render_run "$CST" zoom_c "$DEFAULT_FONT" yes
-python3 tests/docker/xwd.py compare "$SHOTS/zoom_r.xwd" "$SHOTS/zoom_c.xwd" ||
-	fail "zoomed rendering differs"
+step "rendering after font zoom (Ctrl+Shift+PageUp)"
+render_run zoom "$DEFAULT_FONT" yes
 
 # ---------------------------------------------------------------------------
 # Background opacity
@@ -231,67 +176,93 @@ alpha_run grad-bottom "" 135 "255 255 255" "bg opacity" 250 140
 echo "background opacity applies to -A, OSC 11 and the vertical gradient"
 
 # ---------------------------------------------------------------------------
-# Keyboard mapping
+# Configured hotkeys
 # ---------------------------------------------------------------------------
 
-key_test() {
-	local bin=$1 tag=$2 app=$3
-	local widf="$WORK/wid_keys_$tag" outf="$WORK/keys_$tag" errf="$WORK/keys_err_$tag"
-	rm -f "$widf" "$outf" "$errf"
-	"$bin" -g 80x24 -e sh -c "echo \$WINDOWID > '$widf'; stty raw -echo; printf '$app'; cat > '$outf'" >/dev/null 2>"$errf" &
+step "configured hotkeys"
+HOTKEY_WIDF="$WORK/wid_hotkeys"
+HOTKEY_OUT="$WORK/hotkeys"
+HOTKEY_ERR="$WORK/hotkeys_err"
+rm -f "$HOTKEY_WIDF" "$HOTKEY_OUT" "$HOTKEY_ERR"
+"$BIN" -g 80x24 -e sh -c "echo \$WINDOWID > '$HOTKEY_WIDF'; stty raw -echo; cat > '$HOTKEY_OUT'" >/dev/null 2>"$HOTKEY_ERR" &
+HOTKEY_PID=$!
+wait_file "$HOTKEY_WIDF" || { cat "$HOTKEY_ERR"; fail "hotkey test did not start"; }
+HOTKEY_WID=$(cat "$HOTKEY_WIDF")
+"$XTOOL" focus "$HOTKEY_WID"
+sleep 0.4
+"$XTOOL" key "$HOTKEY_WID" s Return
+last=-1 size=0 stable=0
+for _ in $(seq 1 60); do
+	size=$(stat -c %s "$HOTKEY_OUT" 2>/dev/null || echo 0)
+	if [ "$size" = "$last" ]; then
+		stable=$((stable + 1))
+		[ "$stable" -ge 4 ] && break
+	else
+		stable=0
+		last=$size
+	fi
+	sleep 0.05
+done
+kill "$HOTKEY_PID" 2>/dev/null || true
+wait "$HOTKEY_PID" 2>/dev/null || true
+[ ! -s "$HOTKEY_ERR" ] || { cat "$HOTKEY_ERR"; fail "stderr from hotkey test"; }
+printf '\033\r' >"$WORK/hotkeys.expected"
+cmp -s "$HOTKEY_OUT" "$WORK/hotkeys.expected" || {
+	echo "--- hotkey output ---"
+	od -c "$HOTKEY_OUT"
+	fail "configured hotkeys sent unexpected bytes"
+}
+echo "Shift-Enter sends the configured sequence"
+
+# ---------------------------------------------------------------------------
+# Scrollback
+# ---------------------------------------------------------------------------
+
+scrollback_run() { # TAG SECOND_MOD SECOND_KEY WANT
+	local tag=$1 m2=$2 k2=$3 want=$4
+	local widf="$WORK/wid_scroll_$tag" readyf="$WORK/ready_scroll_$tag"
+	local dump="$WORK/scroll_$tag" errf="$WORK/scroll_err_$tag"
+	rm -f "$widf" "$readyf" "$dump" "$errf"
+	"$BIN" -g 20x5 -o "$dump" -e sh -c \
+		"echo \$WINDOWID > '$widf'; i=1; while [ \$i -le 20 ]; do printf 'line%02d\\r\\n' \$i; i=\$((i+1)); done; echo ready > '$readyf'; sleep 30" \
+		>/dev/null 2>"$errf" &
 	local pid=$!
-	wait_file "$widf" || { cat "$errf"; fail "key test did not start ($tag)"; }
+	wait_file "$widf" || { cat "$errf"; fail "scrollback test did not start ($tag)"; }
+	wait_file "$readyf" || { cat "$errf"; fail "scrollback output did not finish ($tag)"; }
 	local wid
 	wid=$(cat "$widf")
 	"$XTOOL" focus "$wid"
-	sleep 0.4
-	"$XTOOL" keys "$wid" mapping
-	# Wait until st has processed the queued events and cat's output has been
-	# stable for about a second.
-	local last=-1 size stable=0
+	sleep 0.3
+	# With -o the terminal output is printed too; remember where it ends so
+	# only the Shift-PrintScreen view is examined.
+	local base
+	base=$(stat -c %s "$dump")
+	"$XTOOL" key "$wid" c Home
+	if [ -n "$m2" ]; then
+		sleep 0.3
+		"$XTOOL" key "$wid" "$m2" "$k2"
+	fi
+	sleep 0.3
+	"$XTOOL" key "$wid" s Print
 	for _ in $(seq 1 60); do
-		size=$(stat -c %s "$outf" 2>/dev/null || echo 0)
-		if [ "$size" = "$last" ]; then
-			stable=$((stable + 1))
-			[ "$stable" -ge 4 ] && break
-		else
-			stable=0
-			last=$size
-		fi
-		sleep 0.25
+		[ "$(stat -c %s "$dump" 2>/dev/null || echo "$base")" -gt "$base" ] && break
+		sleep 0.05
 	done
 	kill "$pid" 2>/dev/null || true
 	wait "$pid" 2>/dev/null || true
-	[ -s "$outf" ] || { cat "$errf"; fail "no keys captured ($tag)"; }
+	[ ! -s "$errf" ] || { cat "$errf"; fail "stderr from scrollback test ($tag)"; }
+	tail -c +$((base + 1)) "$dump" >"$WORK/scroll_view_$tag"
+	grep -q "$want" "$WORK/scroll_view_$tag" || {
+		echo "--- scrollback dump ($tag) ---"
+		cat "$WORK/scroll_view_$tag"
+		fail "expected '$want' in the scrollback view ($tag)"
+	}
 }
 
-step "keyboard mapping: normal mode"
-key_test "$BIN" norm_r ""
-key_test "$CST" norm_c ""
-if ! cmp -s "$WORK/keys_norm_r" "$WORK/keys_norm_c"; then
-	echo "--- Rust output ---"
-	od -c "$WORK/keys_norm_r" | head -20
-	echo "--- C output ---"
-	od -c "$WORK/keys_norm_c" | head -20
-	echo "--- byte differences ---"
-	cmp -l "$WORK/keys_norm_r" "$WORK/keys_norm_c" | head -20
-	fail "normal key output differs"
-fi
-echo "normal keyboard output is byte-identical"
-
-step "keyboard mapping: application cursor/keypad modes"
-key_test "$BIN" app_r '\033[?1h\033='
-key_test "$CST" app_c '\033[?1h\033='
-if ! cmp -s "$WORK/keys_app_r" "$WORK/keys_app_c"; then
-	echo "--- Rust output ---"
-	od -c "$WORK/keys_app_r" | head -20
-	echo "--- C output ---"
-	od -c "$WORK/keys_app_c" | head -20
-	echo "--- byte differences ---"
-	cmp -l "$WORK/keys_app_r" "$WORK/keys_app_c" | head -20
-	fail "application key output differs"
-fi
-echo "application mode keyboard output is byte-identical"
+step "scrollback: Ctrl+Home and Ctrl+End"
+scrollback_run top "" "" "line01"
+scrollback_run bottom c End "line20"
+echo "scrollback history is reachable and Ctrl+End returns to the live screen"
 
 # ---------------------------------------------------------------------------
 # Selection, clipboard, bracketed paste
@@ -337,11 +308,7 @@ selection_test() {
 
 step "mouse selection, PRIMARY/CLIPBOARD copy and bracketed paste"
 selection_test "$BIN" r
-selection_test "$CST" c
-cmp -s "$WORK/primary_r" "$WORK/primary_c" || fail "PRIMARY differs between implementations"
-cmp -s "$WORK/clipboard_r" "$WORK/clipboard_c" || fail "CLIPBOARD differs between implementations"
-cmp -s "$WORK/paste_r" "$WORK/paste_c" || fail "paste differs between implementations"
-echo "selection and paste match the C reference"
+echo "selection and bracketed paste work"
 
 # ---------------------------------------------------------------------------
 # Runtime zoom

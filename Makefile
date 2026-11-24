@@ -16,8 +16,8 @@ st: Cargo.toml Cargo.lock $(wildcard src/*.rs)
 	$(CARGO) build --release
 	cp -f $(RELEASE) st
 
-# The full suite (unit tests, X11 end-to-end, differential tests against the C
-# original) runs headless in Docker. See tests/docker/run.sh.
+# The full suite (unit tests and X11 end-to-end tests) runs headless in
+# Docker. See tests/docker/run.sh.
 test: docker-test
 
 docker-test:
@@ -39,9 +39,8 @@ clean:
 dist: clean
 	mkdir -p st-$(VERSION)
 	cp -R Cargo.toml Cargo.lock README.md LICENSE Makefile FAQ LEGACY TODO \
-		config.def.rs st.info st.1 src original_source docker tests \
+		config.def.rs st.info st.1 src docker tests \
 		compose.yaml .dockerignore st-$(VERSION)
-	rm -f st-$(VERSION)/original_source/*.o st-$(VERSION)/original_source/st
 	tar -cf - st-$(VERSION) | gzip > st-$(VERSION).tar.gz
 	rm -rf st-$(VERSION)
 
