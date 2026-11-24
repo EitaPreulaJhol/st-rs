@@ -1,0 +1,18 @@
+[package]
+name = "st"
+version = "0.9.3"
+edition = "2021"
+rust-version = "1.77"
+description = "st - simple terminal (Rust port)"
+license = "MIT"
+
+[[bin]]
+name = "st"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+x11 = { version = "2.21", default-features = false, features = ["xlib", "xft", "xrender"] }
+
+[profile.release]
+opt-level = 3

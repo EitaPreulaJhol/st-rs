@@ -1,0 +1,23 @@
+services:
+  test:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: st-test:local
+    init: true
+    working_dir: /src
+    environment:
+      DISPLAY: ":99"
+      LANG: "C.UTF-8"
+      LC_ALL: "C.UTF-8"
+      CARGO_TARGET_DIR: "/cargo-target"
+      PYTHONDONTWRITEBYTECODE: "1"
+      ST_FUZZ_CASES: "${ST_FUZZ_CASES:-80}"
+      ST_FUZZ_SEED: "${ST_FUZZ_SEED:-0xC0FFEE}"
+    volumes:
+      - .:/src
+      - st-cargo-target:/cargo-target
+    command: ["/src/tests/docker/run.sh"]
+
+volumes:
+  st-cargo-target:

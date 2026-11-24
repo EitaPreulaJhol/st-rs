@@ -1,0 +1,5 @@
+/target
+/st
+/st-*.tar.gz
+tests/docker/__pycache__/
+tests/docker/bin/
