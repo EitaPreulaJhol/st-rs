@@ -1,6 +1,7 @@
 //! Terminal emulator core: UTF-8, escape sequences, screen buffers, selection
 //! and the pty.  This is a direct port of the original `st.c`.
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::atomic::Ordering;
@@ -223,7 +224,7 @@ impl App {
     pub fn tlinelen(&self, y: i32) -> i32 {
         let line = self.tline(y);
         let mut i = self.term.col;
-        if line[(i - 1) as usize].mode & ATTR_WRAP != 0 {
+        if line_is_wrapped(line) {
             return i;
         }
         while i > 0 && line[(i - 1) as usize].u == b' ' as Rune {
@@ -1003,6 +1004,56 @@ extern "C" fn sigchld_handler(_sig: libc::c_int) {
         }
         libc::_exit(0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Soft-wrapped lines
+// ---------------------------------------------------------------------------
+
+/// Whether a screen row continues on the next one.  The mark normally sits
+/// on the last cell, but `tputc` puts it on the double-width cell when a wide
+/// character ends the row, so both places are checked.
+fn line_is_wrapped(line: &Line) -> bool {
+    let n = line.len();
+    if n == 0 {
+        return false;
+    }
+    if line[n - 1].mode & ATTR_WRAP != 0 {
+        return true;
+    }
+    n >= 2 && line[n - 1].mode & ATTR_WDUMMY != 0 && line[n - 2].mode & ATTR_WRAP != 0
+}
+
+/// Number of cells of `line` that carry text.  Trailing blanks are dropped so
+/// that re-wrapping a line does not drag padding along with it; a row that
+/// continues on the next one is counted in full.
+fn line_text_len(line: &Line) -> usize {
+    if line_is_wrapped(line) {
+        return line.len();
+    }
+    let mut i = line.len();
+    while i > 0 {
+        let g = &line[i - 1];
+        if g.mode & (ATTR_WIDE | ATTR_WDUMMY) != 0 || (g.u != b' ' as Rune && g.u != 0) {
+            break;
+        }
+        i -= 1;
+    }
+    i
+}
+
+/// Append a full row that continues on the next one, marking the soft-wrap.
+fn push_continued(rows: &mut Vec<Line>, mut line: Line) {
+    let n = line.len();
+    if n > 0 {
+        let i = if n >= 2 && line[n - 1].mode & ATTR_WDUMMY != 0 {
+            n - 2
+        } else {
+            n - 1
+        };
+        line[i].mode |= ATTR_WRAP;
+    }
+    rows.push(line);
 }
 
 // ---------------------------------------------------------------------------
@@ -2537,6 +2588,14 @@ impl App {
             return;
         }
 
+        // A width change re-wraps the main screen instead of clipping it.
+        // The alternate screen keeps the original truncating behaviour: what
+        // does not fit has no scrollback to go to there.
+        if col != self.term.col && !self.is_set(MODE_ALTSCREEN) && !self.term.line.is_empty() {
+            self.treflow(col, row);
+            return;
+        }
+
         let minrow = min(row, self.term.row);
         let mincol = min(col, self.term.col);
 
@@ -2563,7 +2622,7 @@ impl App {
         self.term.line.resize_with(row as usize, Vec::new);
         self.term.alt.resize_with(row as usize, Vec::new);
         self.term.dirty.resize(row as usize, false);
-        self.term.tabs.resize(col as usize, false);
+        self.retab(self.term.col as usize, col as usize);
 
         for i in 0..minrow as usize {
             self.term.line[i].resize(col as usize, Glyph::default());
@@ -2584,28 +2643,6 @@ impl App {
         };
         for line in self.term.hist.iter_mut() {
             line.resize(col as usize, blank);
-        }
-
-        if col > self.term.col {
-            let oldcol = self.term.col as usize;
-            for t in self.term.tabs[oldcol..col as usize].iter_mut() {
-                *t = false;
-            }
-            let mut bp = oldcol;
-            loop {
-                if bp == 0 {
-                    break;
-                }
-                bp -= 1;
-                if self.term.tabs[bp] {
-                    break;
-                }
-            }
-            bp += TABSPACES as usize;
-            while bp < col as usize {
-                self.term.tabs[bp] = true;
-                bp += TABSPACES as usize;
-            }
         }
 
         self.term.col = col;
@@ -2638,6 +2675,178 @@ impl App {
             self.tcursor(CursorMovement::Load);
         }
         self.term.c = c;
+    }
+
+    /// Keep the tab stop pattern after a width change: new columns continue
+    /// the multiples of `TABSPACES` reached from the last stop before the old
+    /// width, exactly like the C original.
+    fn retab(&mut self, oldcol: usize, col: usize) {
+        self.term.tabs.resize(col, false);
+        if col <= oldcol {
+            return;
+        }
+        let mut bp = oldcol;
+        loop {
+            if bp == 0 {
+                break;
+            }
+            bp -= 1;
+            if self.term.tabs[bp] {
+                break;
+            }
+        }
+        bp += TABSPACES as usize;
+        while bp < col {
+            self.term.tabs[bp] = true;
+            bp += TABSPACES as usize;
+        }
+    }
+
+    /// Re-wrap the main screen and its scrollback to `col` cells per row.
+    ///
+    /// Rows joined by a soft-wrap mark are concatenated back into logical
+    /// lines and split again at the new width, so shrinking the window wraps
+    /// long lines instead of cutting them and growing it restores them.  The
+    /// cursor follows its cell, rows that no longer fit move into history and
+    /// the screen is refilled from history when the re-wrap needs fewer rows.
+    fn treflow(&mut self, col: i32, row: i32) {
+        let new_col = col as usize;
+        let new_row = row as usize;
+        let cur = self.term.c;
+        let cur_row = self.term.hist.len() + cur.y as usize;
+        // With a pending wrap the cursor sits past the last written cell.
+        let wrapnext = cur.state & CURSOR_WRAPNEXT != 0;
+
+        // Join the physical rows (history first) into logical lines.
+        let src: Vec<&Line> = self.term.hist.iter().chain(self.term.line.iter()).collect();
+        let mut logical: Vec<Vec<Glyph>> = Vec::new();
+        let mut pending: Vec<Glyph> = Vec::new();
+        let mut cur_logical = 0usize;
+        let mut cur_offset = 0usize;
+        for (i, line) in src.iter().enumerate() {
+            let wrapped = line_is_wrapped(line);
+            let mut n = line_text_len(line);
+            if n > 0
+                && wrapped
+                && line[n - 1].u == b' ' as Rune
+                && src
+                    .get(i + 1)
+                    .and_then(|l| l.first())
+                    .is_some_and(|g| g.mode & ATTR_WIDE != 0)
+            {
+                // A double-width glyph that had to be pushed whole onto the
+                // next row left a padding blank at the end of this one.
+                n -= 1;
+            }
+            if i == cur_row {
+                cur_logical = logical.len();
+                let mut off = min(cur.x, n as i32).max(0) as usize;
+                if wrapnext && n > 0 {
+                    off = off.min(n - 1) + 1;
+                }
+                cur_offset = pending.len() + off;
+            }
+            pending.extend_from_slice(&line[..n]);
+            if !wrapped {
+                logical.push(std::mem::take(&mut pending));
+            }
+        }
+        if !pending.is_empty() {
+            logical.push(pending);
+        }
+
+        // Split the logical lines at the new width, remembering where the
+        // cursor cell lands.
+        let blank = Glyph {
+            u: b' ' as Rune,
+            fg: DEFAULTFG,
+            bg: DEFAULTBG,
+            mode: ATTR_NULL,
+        };
+        let mut rows: Vec<Line> = Vec::new();
+        let mut cur_abs_row = 0usize;
+        let mut cur_col = 0usize;
+        let mut cur_wrapnext = false;
+        for (li, cells) in logical.iter().enumerate() {
+            let here = li == cur_logical;
+            let mut line = vec![blank; new_col];
+            let mut x = 0usize;
+
+            for (ci, cell) in cells.iter().enumerate() {
+                let mut g = *cell;
+                g.mode &= !ATTR_WRAP;
+                // A double-width glyph must not straddle two rows.
+                if x + 1 == new_col && g.mode & ATTR_WIDE != 0 {
+                    push_continued(&mut rows, line);
+                    line = vec![blank; new_col];
+                    x = 0;
+                }
+                if x == new_col {
+                    push_continued(&mut rows, line);
+                    line = vec![blank; new_col];
+                    x = 0;
+                }
+                if here && ci == cur_offset {
+                    cur_abs_row = rows.len();
+                    cur_col = x;
+                }
+                line[x] = g;
+                x += 1;
+            }
+
+            if here && cur_offset >= cells.len() {
+                cur_abs_row = rows.len();
+                cur_col = x;
+                if cur_col == new_col {
+                    // The cursor sat just past a row-filling line: leave it
+                    // pending a wrap, as tputc does at the last column.
+                    cur_col = new_col - 1;
+                    cur_wrapnext = true;
+                }
+            }
+            rows.push(line);
+        }
+
+        // Keep the newest rows on screen and move the rest into history.  If
+        // the rows below the cursor grew past the screen on their own, the
+        // cursor still wins and the surplus at the bottom is dropped.
+        let mut start = rows.len().saturating_sub(new_row);
+        if start > cur_abs_row {
+            start = cur_abs_row;
+        }
+        let mut screen: Vec<Line> = rows.split_off(start);
+        screen.truncate(new_row);
+        screen.resize_with(new_row, || vec![blank; new_col]);
+        let mut hist: VecDeque<Line> = rows.into();
+        while hist.len() > config::SCROLLBACK {
+            hist.pop_front();
+        }
+
+        let oldcol = self.term.col as usize;
+        self.term.line = screen;
+        self.term.hist = hist;
+        self.term.col = col;
+        self.term.row = row;
+        self.term.dirty = vec![true; new_row];
+        self.retab(oldcol, new_col);
+
+        // The hidden alternate buffer is clipped as before: it is not part
+        // of the scrollback and switching back to it resets it anyway.
+        self.term.alt.truncate(new_row);
+        self.term.alt.resize_with(new_row, Vec::new);
+        for line in self.term.alt.iter_mut() {
+            line.resize(new_col, Glyph::default());
+        }
+
+        self.tsetscroll(0, row - 1);
+        self.term.c.x = limit(cur_col as i32, 0, col - 1);
+        self.term.c.y = (cur_abs_row - start) as i32;
+        self.term.c.state &= !CURSOR_WRAPNEXT;
+        if cur_wrapnext {
+            self.term.c.state |= CURSOR_WRAPNEXT;
+        }
+        self.term.scr = limit(self.term.scr, 0, self.term.hist.len() as i32);
+        self.selclear();
     }
 
     pub fn resettitle(&mut self) {
@@ -2867,6 +3076,29 @@ mod tests {
 
     fn cell(app: &App, x: i32, y: i32) -> Glyph {
         app.term.line[y as usize][x as usize]
+    }
+
+    /// Text of the whole buffer (history + screen) with soft-wrapped rows
+    /// joined back together; trailing blank rows are dropped.
+    fn logical_text(app: &App) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for line in app.term.hist.iter().chain(app.term.line.iter()) {
+            let n = line_text_len(line);
+            for g in &line[..n] {
+                cur.push(g.u as u8 as char);
+            }
+            if !line_is_wrapped(line) {
+                out.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        while out.last().is_some_and(|l| l.is_empty()) {
+            out.pop();
+        }
+        out
     }
 
     fn row_text(app: &App, y: i32) -> String {
@@ -3189,19 +3421,180 @@ mod tests {
         assert_eq!(cell(&app, 0, 2).u, 'e' as Rune);
         assert_eq!((app.term.c.x, app.term.c.y), (1, 2));
 
-        // grow again: new rows are blank
+        // grow again: the screen keeps the newest rows and refills the top
+        // ones from history
         app.tresize(16, 6);
         assert_eq!(app.term.row, 6);
-        assert_eq!(cell(&app, 0, 2).u, 'e' as Rune);
+        assert_eq!(row_text(&app, 0), "a");
+        assert_eq!(row_text(&app, 4), "e");
         assert_eq!(cell(&app, 0, 5).u, ' ' as Rune);
         assert_eq!(cell(&app, 15, 5).u, ' ' as Rune);
-        assert_eq!(app.term.c.y, 2);
+        assert_eq!((app.term.c.x, app.term.c.y), (1, 4));
 
         // shrink width: retained columns are kept, cursor clamped
         app.tresize(5, 6);
         assert_eq!(app.term.col, 5);
         assert_eq!(app.term.c.x, 1);
         assert_eq!(app.term.line[5].len(), 5);
+    }
+
+    #[test]
+    fn reflow_wraps_and_unwraps_lines() {
+        let mut app = new_app(10, 4);
+        feed(&mut app, b"abcdefghijklmnopqrst"); // 20 cells, two rows
+        assert_ne!(cell(&app, 9, 0).mode & ATTR_WRAP, 0);
+        assert_eq!(row_text(&app, 0), "abcdefghij");
+        assert_eq!(row_text(&app, 1), "klmnopqrst");
+
+        // narrowing splits the logical line at the new width; the newest
+        // rows stay on screen and the rest moves into history
+        app.tresize(5, 4);
+        assert_eq!(app.term.hist.len(), 2);
+        assert_eq!(row_text(&app, 0), "klmno");
+        assert_eq!(row_text(&app, 1), "pqrst");
+        assert_eq!((app.term.c.x, app.term.c.y), (4, 1));
+        assert_ne!(app.term.c.state & CURSOR_WRAPNEXT, 0);
+
+        // widening joins the rows marked as wrapped again
+        app.tresize(10, 4);
+        assert_eq!(app.term.hist.len(), 0);
+        assert_eq!(row_text(&app, 0), "abcdefghij");
+        assert_eq!(row_text(&app, 1), "klmnopqrst");
+        assert_eq!((app.term.c.x, app.term.c.y), (9, 1));
+        assert_ne!(app.term.c.state & CURSOR_WRAPNEXT, 0);
+
+        // the cursor keeps its cell when the whole line fits one row
+        app.tresize(20, 4);
+        assert_eq!(row_text(&app, 0), "abcdefghijklmnopqrst");
+        assert_eq!(app.term.hist.len(), 0);
+        assert_eq!((app.term.c.x, app.term.c.y), (19, 0));
+        assert_ne!(app.term.c.state & CURSOR_WRAPNEXT, 0);
+    }
+
+    #[test]
+    fn reflow_pulls_rows_from_history() {
+        let mut app = new_app(10, 3);
+        feed(&mut app, b"0123456789abc\r\nsecond\r\nthird\r\n");
+        // "0123456789abc" soft-wrapped; two rows are in history
+        assert_eq!(app.term.hist.len(), 2);
+        assert_eq!(row_text(&app, 0), "second");
+        assert_eq!(row_text(&app, 1), "third");
+
+        app.tresize(5, 3);
+        // the wrapped line is re-flowed and keeps all of its text
+        let hist: Vec<String> = app
+            .term
+            .hist
+            .iter()
+            .map(|l| l[..line_text_len(l)].iter().map(|g| g.u as u8 as char).collect())
+            .collect();
+        let screen = format!("{}{}", row_text(&app, 0), row_text(&app, 1));
+        assert_eq!(format!("{}{}", hist.join(""), screen), "0123456789abcsecondthird");
+        // the cursor was on the blank row below "third" and stays there
+        assert_eq!((app.term.c.x, app.term.c.y), (0, 2));
+
+        // and growing back restores the original rows
+        app.tresize(10, 3);
+        assert_eq!(app.term.hist.len(), 2);
+        assert_eq!(row_text(&app, 0), "second");
+        assert_eq!(row_text(&app, 1), "third");
+    }
+
+    #[test]
+    fn reflow_round_trip_preserves_text() {
+        let mut app = new_app(40, 8);
+        for i in 0..120 {
+            let line = format!("line {} {}\r\n", i, "x".repeat(i % 37));
+            feed(&mut app, line.as_bytes());
+        }
+        let want = logical_text(&app);
+        assert!(app.term.hist.len() > 8);
+
+        for (col, row) in [(80, 8), (12, 5), (40, 8), (7, 3), (40, 8), (3, 2), (40, 8)] {
+            app.tresize(col, row);
+            assert_eq!(logical_text(&app), want, "reflow at {}x{}", col, row);
+            for line in app.term.line.iter().chain(app.term.hist.iter()) {
+                assert_eq!(line.len(), col as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn reflow_wide_char_invariants() {
+        let mut app = new_app(20, 5);
+        for i in 0..60 {
+            let line = format!("{}\u{4e16}{}\r\n", "a".repeat(i % 9), "b".repeat(i % 7));
+            feed(&mut app, line.as_bytes());
+        }
+        let want = logical_text(&app);
+
+        for (col, row) in [(9, 4), (20, 5), (6, 3), (20, 5), (3, 4), (21, 6)] {
+            app.tresize(col, row);
+            for line in app.term.line.iter().chain(app.term.hist.iter()) {
+                let n = line.len();
+                for i in 0..n {
+                    if line[i].mode & ATTR_WIDE != 0 {
+                        assert!(i + 1 < n, "wide glyph at the end of {}x{}", col, row);
+                        assert_eq!(line[i + 1].mode, ATTR_WDUMMY);
+                    }
+                    if line[i].mode & ATTR_WDUMMY != 0 {
+                        assert!(i > 0, "orphan wide dummy at {}x{}", col, row);
+                        assert_ne!(line[i - 1].mode & ATTR_WIDE, 0);
+                    }
+                }
+            }
+            // Coming back to the original width restores the exact text; the
+            // narrower widths may only add a padding blank before a wide
+            // glyph that no longer fits.
+            if col == 20 {
+                assert_eq!(logical_text(&app), want);
+            }
+        }
+    }
+
+    #[test]
+    fn reflow_while_scrolled_back() {
+        let mut app = new_app(10, 3);
+        feed(&mut app, b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        app.kscrollup(&Arg::i(2));
+        assert!(app.term.scr > 0);
+
+        app.tresize(5, 3);
+        assert!(app.term.scr <= app.term.hist.len() as i32);
+        // every row of the view must still be indexed safely
+        for y in 0..app.term.row {
+            assert_eq!(app.tline(y).len(), 5);
+            let _ = app.tlinelen(y);
+        }
+    }
+
+    #[test]
+    fn reflow_keeps_wide_chars_whole() {
+        let mut app = new_app(6, 2);
+        feed(&mut app, "abc\u{4e16}".as_bytes());
+        // narrowing places the wide char on the next row instead of splitting
+        app.tresize(4, 2);
+        assert_eq!(app.term.hist.len(), 1);
+        assert_eq!(
+            app.term.hist[0][..3].iter().map(|g| g.u).collect::<Vec<_>>(),
+            [b'a' as Rune, b'b' as Rune, b'c' as Rune]
+        );
+        assert_eq!(app.term.line[0][0].u, 0x4e16);
+        assert_ne!(app.term.line[0][0].mode & ATTR_WIDE, 0);
+        assert_eq!(app.term.line[0][1].mode, ATTR_WDUMMY);
+
+        // widening joins it back without accumulating padding blanks
+        app.tresize(6, 2);
+        assert!(app.term.hist.is_empty());
+        for (i, u) in [b'a' as Rune, b'b' as Rune, b'c' as Rune, 0x4e16]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(app.term.line[0][i].u, *u);
+        }
+        assert_eq!(app.term.line[0][4].mode, ATTR_WDUMMY);
+        assert_eq!(app.term.line[0][5].u, b' ' as Rune);
+        assert_eq!(row_text(&app, 1), "");
     }
 
     #[test]
@@ -3262,9 +3655,10 @@ mod tests {
             assert!(app.term.c.x >= 0 && app.term.c.x < app.term.col);
             assert!(app.term.c.y >= 0 && app.term.c.y < app.term.row);
             assert_eq!(app.term.line.len(), row as usize);
-            for line in &app.term.line {
+            for line in app.term.line.iter().chain(app.term.hist.iter()) {
                 assert_eq!(line.len(), col as usize);
             }
+            assert!(app.term.scr >= 0 && app.term.scr <= app.term.hist.len() as i32);
         }
     }
 

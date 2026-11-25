@@ -149,8 +149,15 @@ the application.
 Scrolling only changes the view: the terminal keeps parsing output and the
 live screen keeps updating. Selection and copying, URL clicking, and the
 print-screen shortcut use the viewed lines, so text from history can be
-selected and copied. The cursor is hidden while scrolled back. Resizing
-re-wraps history by truncating or padding lines; it does not reflow text.
+selected and copied. The cursor is hidden while scrolled back.
+
+Resizing re-wraps the text: lines that were cut at the old width are joined
+back and split at the new one, scrollback included, so growing the window
+restores what shrinking it wrapped. The cursor follows its cell; when
+re-wrapping needs fewer rows the space is filled from history, and when it
+needs more, the surplus rows move into history. The alternate screen keeps
+st's original truncating behaviour. Zooming the font changes how many columns
+and rows fit in the window, so it re-wraps the same way.
 
 ### Colours
 
@@ -257,7 +264,8 @@ The suite covers:
 * Rust unit tests: UTF-8 encode/decode (including malformed input), base64,
   text output, wrapping, wide characters, tabs, scrolling, alternate screen,
   erase modes, SGR/256/true colour, scrollback history/viewport/selection,
-  selection snapping/rectangular/wrapped selections, resize fuzzing, and
+  selection snapping/rectangular/wrapped selections, reflow on width changes
+  (wrapping, unwrapping, history, wide characters), resize fuzzing, and
   selections surviving (or being cleared on) resize.
 * Rendering: screenshots of the configured font, an explicit font, and a zoomed
   terminal exercise bold/faint/italic/underline/struck/reverse/invisible
