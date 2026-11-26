@@ -21,7 +21,7 @@ jobs:
     # an older glibc too.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Annotated tags are needed for --notes-from-tag.
           fetch-depth: 0
