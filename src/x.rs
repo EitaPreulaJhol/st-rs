@@ -691,6 +691,22 @@ impl App {
 // Colours
 // ---------------------------------------------------------------------------
 
+/// Underline thickness in pixels for a cell `ch` pixels tall.
+pub fn underline_thickness(ch: i32) -> i32 {
+    ((ch + 8) / 18).max(1)
+}
+
+/// Undercurl amplitude: the wave spans `2 * amp` rows plus the thickness.
+pub fn curly_amplitude(ch: i32) -> i32 {
+    (ch / 12).max(1)
+}
+
+/// Vertical offset (0 ..= 2*amp) of the undercurl at window column `x`.
+pub fn curly_offset(x: i32, amp: i32, period: f32) -> i32 {
+    let phase = (x as f32 / period) * std::f32::consts::TAU;
+    (amp as f32 * (1.0 - phase.cos())).round() as i32
+}
+
 fn sixd_to_16bit(x: c_int) -> c_ushort {
     if x == 0 {
         0
@@ -2006,15 +2022,41 @@ impl App {
 
         // Underline and strikethrough.
         if base.mode & (ATTR_UNDERLINE | ATTR_URL) != 0 {
-            unsafe {
-                XftDrawRect(
-                    self.xw.draw,
-                    &fg_col,
-                    winx,
-                    winy + (self.dc.font.ascent as f32 * config::CHSCALE) as i32 + 1,
-                    width as c_uint,
-                    1,
-                );
+            let style = if base.mode & ATTR_UNDERLINE != 0 && base.ustyle != UL_NONE {
+                base.ustyle
+            } else {
+                UL_SINGLE
+            };
+            // An explicit underline colour (SGR 58) replaces the foreground,
+            // except under the URL highlight and for invisible text.
+            let mut ucol = fg_col;
+            let mut ualloc = false;
+            if base.ucolor & UCOLOR_SET != 0
+                && base.mode & (ATTR_URL | ATTR_INVISIBLE) == 0
+                && !(base.mode & ATTR_BLINK != 0 && self.win_is_set(MODE_BLINK))
+            {
+                let c = base.ucolor & !UCOLOR_SET;
+                if is_truecolor(c) {
+                    ucol = unsafe {
+                        alloc_color(
+                            self.xw.dpy,
+                            self.xw.vis,
+                            self.xw.cmap,
+                            ((c & 0xff0000) >> 8) as c_ushort,
+                            (c & 0xff00) as c_ushort,
+                            ((c & 0xff) << 8) as c_ushort,
+                            0xffff,
+                        )
+                    };
+                    ualloc = true;
+                } else if (c as usize) < self.dc.col.len() {
+                    ucol = self.dc.col[c as usize];
+                }
+            }
+            let base_y = winy + (self.dc.font.ascent as f32 * config::CHSCALE) as i32 + 1;
+            self.xdrawunderline(style, &ucol, winx, base_y, width, winy + self.win.ch);
+            if ualloc {
+                unsafe { XftColorFree(self.xw.dpy, self.xw.vis, self.xw.cmap, &mut ucol) };
             }
         }
         if base.mode & ATTR_STRUCK != 0 {
@@ -2032,6 +2074,64 @@ impl App {
 
         unsafe {
             XftDrawSetClip(self.xw.draw, ptr::null_mut());
+        }
+    }
+
+    /// Draw an underline of `style` starting at row `y` (the classic st
+    /// underline position) across `width` pixels.  `bottom` is the first
+    /// pixel row below the cell; patterns are aligned to window coordinates
+    /// so neighbouring runs join up.
+    fn xdrawunderline(&mut self, style: u8, col: &XftColor, x: i32, y: i32, width: i32, bottom: i32) {
+        let t = underline_thickness(self.win.ch);
+        let rect = |rx: i32, ry: i32, rw: i32, rh: i32| unsafe {
+            if rw > 0 && rh > 0 {
+                XftDrawRect(self.xw.draw, col, rx, ry, rw as c_uint, rh as c_uint);
+            }
+        };
+        match style {
+            UL_DOUBLE => {
+                let gap = t.max(1);
+                let y = y.min(bottom - 2 * t - gap).max(y - 2 * t - gap);
+                rect(x, y, width, t);
+                rect(x, y + t + gap, width, t);
+            }
+            UL_CURLY => {
+                let amp = curly_amplitude(self.win.ch);
+                let top = y.min(bottom - 2 * amp - t);
+                let period = (self.win.cw.max(4)) as f32;
+                let mut prev: Option<i32> = None;
+                for dx in 0..width {
+                    let cy = curly_offset(x + dx, amp, period) + top;
+                    let (a, b) = match prev {
+                        Some(p) => (p.min(cy), p.max(cy)),
+                        None => (cy, cy),
+                    };
+                    rect(x + dx, a, 1, b - a + t);
+                    prev = Some(cy);
+                }
+            }
+            UL_DOTTED => {
+                let step = 2 * t;
+                let mut px = x - x.rem_euclid(step);
+                while px < x + width {
+                    let a = px.max(x);
+                    let b = (px + t).min(x + width);
+                    rect(a, y, b - a, t);
+                    px += step;
+                }
+            }
+            UL_DASHED => {
+                let dash = (self.win.cw / 2).max(2 * t).max(2);
+                let step = 2 * dash;
+                let mut px = x - x.rem_euclid(step);
+                while px < x + width {
+                    let a = px.max(x);
+                    let b = (px + dash).min(x + width);
+                    rect(a, y, b - a, t);
+                    px += step;
+                }
+            }
+            _ => rect(x, y, width, t),
         }
     }
 
@@ -2271,7 +2371,7 @@ impl App {
             if self.selected(x, y1) {
                 new.mode ^= ATTR_REVERSE;
             }
-            if i > 0 && (base.mode != new.mode || base.fg != new.fg || base.bg != new.bg) {
+            if i > 0 && !base.same_attr(&new) {
                 self.xdrawglyphfontspecs(&specs_buf[off..off + i], base, i, ox, y1);
                 off += i;
                 remaining -= i;
@@ -3002,7 +3102,12 @@ impl App {
                 }
             }
 
-            // idle detected or maxlatency exhausted -> draw
+            // idle detected or maxlatency exhausted -> draw, unless the
+            // application asked for synchronized output (mode 2026).
+            if let Some(wait) = self.sync_pending(now) {
+                timeout = wait.max(1.0);
+                continue;
+            }
             timeout = -1.0;
             if config::BLINKTIMEOUT != 0 && (self.cursorblinks || self.tattrset(ATTR_BLINK)) {
                 let elapsed = lastblink

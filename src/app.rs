@@ -37,6 +37,7 @@ pub const MODE_CRLF: i32 = 1 << 3;
 pub const MODE_ECHO: i32 = 1 << 4;
 pub const MODE_PRINT: i32 = 1 << 5;
 pub const MODE_UTF8: i32 = 1 << 6;
+pub const MODE_SYNC: i32 = 1 << 7; // synchronized output (mode 2026)
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CursorMovement {
@@ -124,9 +125,41 @@ pub type Line = Vec<Glyph>;
 pub struct Glyph {
     pub u: Rune,
     pub mode: u16,
+    /// Underline style (`UL_*`); `ATTR_UNDERLINE` is set whenever this is
+    /// not `UL_NONE`.
+    pub ustyle: u8,
     pub fg: u32,
     pub bg: u32,
+    /// Underline colour: 0 follows the foreground, otherwise a palette index
+    /// or true colour value tagged with `UCOLOR_SET`.
+    pub ucolor: u32,
+    /// OSC 8 hyperlink: index into `App::links`, 0 for none.
+    pub link: u32,
 }
+
+impl Glyph {
+    /// Same rendition, ignoring the character itself.
+    #[inline]
+    pub fn same_attr(&self, o: &Glyph) -> bool {
+        self.mode == o.mode
+            && self.fg == o.fg
+            && self.bg == o.bg
+            && self.ustyle == o.ustyle
+            && self.ucolor == o.ucolor
+            && self.link == o.link
+    }
+}
+
+// underline styles (SGR 4:n)
+pub const UL_NONE: u8 = 0;
+pub const UL_SINGLE: u8 = 1;
+pub const UL_DOUBLE: u8 = 2;
+pub const UL_CURLY: u8 = 3;
+pub const UL_DOTTED: u8 = 4;
+pub const UL_DASHED: u8 = 5;
+
+/// Tag for an explicitly set underline colour in `Glyph::ucolor`.
+pub const UCOLOR_SET: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Arg(pub ArgVal);
@@ -172,8 +205,11 @@ impl TCursor {
             attr: Glyph {
                 u: 0,
                 mode: ATTR_NULL,
+                ustyle: UL_NONE,
                 fg,
                 bg,
+                ucolor: 0,
+                link: 0,
             },
             x: 0,
             y: 0,
@@ -276,8 +312,13 @@ impl Term {
 pub struct CSIEscape {
     pub buf: [u8; ESC_BUF_SIZ],
     pub len: usize,
+    /// 1 for a DEC private (`?`) sequence.
     pub priv_: u8,
+    /// Parameter prefix character (`?`, `>`, `=`, `<`), or 0.
+    pub prefix: u8,
     pub arg: [i32; ESC_ARG_SIZ],
+    /// `sub[i]`: argument `i` was separated from the previous one by `:`.
+    pub sub: [bool; ESC_ARG_SIZ],
     pub narg: usize,
     pub mode: [u8; 2],
 }
@@ -288,7 +329,9 @@ impl Default for CSIEscape {
             buf: [0; ESC_BUF_SIZ],
             len: 0,
             priv_: 0,
+            prefix: 0,
             arg: [0; ESC_ARG_SIZ],
+            sub: [false; ESC_ARG_SIZ],
             narg: 0,
             mode: [0; 2],
         }
@@ -564,6 +607,26 @@ pub struct App {
 
     /// Current cursor style blinks (styles 0, 1, 3, 5 and 7).
     pub cursorblinks: bool,
+
+    /// When synchronized output (mode 2026) was switched on.
+    pub sync_since: Option<Instant>,
+
+    /// OSC 8 hyperlink targets; `Glyph::link` indexes this table and entry 0
+    /// is the "no link" placeholder.
+    pub links: Vec<Vec<u8>>,
+    /// (id, URI) -> index in `links`, so repeated links share an entry.
+    pub linkids: std::collections::HashMap<(Vec<u8>, Vec<u8>), u32>,
+
+    /// Working directory reported by the shell through OSC 7.
+    pub cwd: Option<Vec<u8>>,
+
+    /// Scrollback search state while the search bar is open.
+    pub search: Option<crate::search::Search>,
+
+    /// Bytes the terminal answered with, captured instead of written while
+    /// unit tests run without a tty.
+    #[cfg(test)]
+    pub test_out: Vec<u8>,
 }
 
 impl App {

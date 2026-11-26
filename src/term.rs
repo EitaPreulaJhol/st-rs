@@ -902,6 +902,11 @@ impl App {
     }
 
     fn ttywriteraw(&mut self, s: &[u8]) {
+        #[cfg(test)]
+        if CMDFD.load(Ordering::Relaxed) < 0 {
+            self.test_out.extend_from_slice(s);
+            return;
+        }
         let mut s = s;
         let mut lim: usize = 256;
 
@@ -1356,6 +1361,9 @@ impl App {
                 gp.fg = self.term.c.attr.fg;
                 gp.bg = self.term.c.attr.bg;
                 gp.mode = 0;
+                gp.ustyle = UL_NONE;
+                gp.ucolor = 0;
+                gp.link = 0;
                 gp.u = b' ' as Rune;
             }
         }
@@ -1493,44 +1501,84 @@ fn strtol10(s: &[u8], start: usize) -> (i64, usize) {
     (if neg { -v } else { v }, i)
 }
 
+/// Capabilities reported through XTGETTCAP: `Some(Some(v))` for a string or
+/// number, `Some(None)` for a boolean that is present, `None` if unknown.
+fn tcap_value(name: &[u8]) -> Option<Option<String>> {
+    let v = match name {
+        b"TN" | b"name" => Some(config::TERMNAME.to_string()),
+        b"Co" | b"colors" => Some("256".to_string()),
+        b"RGB" | b"Tc" | b"Su" => None,
+        b"Smulx" => Some("\x1b[4:%p1%dm".to_string()),
+        b"Setulc" => Some(
+            "\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%dm".to_string(),
+        ),
+        b"Sync" => Some("\x1b[?2026%?%p1%{1}%-%tl%eh%;".to_string()),
+        b"Ss" => Some("\x1b[%p1%d q".to_string()),
+        b"Se" => Some("\x1b[2 q".to_string()),
+        _ => return None,
+    };
+    Some(v)
+}
+
+pub fn hexencode(b: &[u8]) -> String {
+    b.iter().map(|c| format!("{:02X}", c)).collect()
+}
+
+pub fn hexdecode(s: &[u8]) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    s.chunks(2)
+        .map(|p| {
+            let h = (p[0] as char).to_digit(16)?;
+            let l = (p[1] as char).to_digit(16)?;
+            Some((h * 16 + l) as u8)
+        })
+        .collect()
+}
+
 impl App {
     pub fn csiparse(&mut self) {
         let buf = self.csiescseq.buf;
         let len = self.csiescseq.len;
         let mut p = 0usize;
-        let mut sep = b';';
         let mut narg = 0usize;
-        let mut priv_ = 0u8;
 
-        if p < len && buf[p] == b'?' {
-            priv_ = 1;
+        // Parameter prefix: `?` (DEC private), `>`, `=` or `<`.
+        let mut prefix = 0u8;
+        if p < len && matches!(buf[p], b'?' | b'>' | b'=' | b'<') {
+            prefix = buf[p];
             p += 1;
         }
-        self.csiescseq.priv_ = priv_;
+        self.csiescseq.prefix = prefix;
+        self.csiescseq.priv_ = (prefix == b'?') as u8;
+        self.csiescseq.sub = [false; ESC_ARG_SIZ];
 
         let mut parse: Vec<u8> = buf[..len].to_vec();
         parse.push(0);
 
+        // Arguments are separated by `;`; `:` introduces a sub-parameter
+        // (ITU T.416 colours, underline styles).  Each separator is looked
+        // at on its own, so `38:2::1:2:3;4:3` keeps its structure.
+        let mut next_sub = false;
         while p < len {
             let (v, np) = strtol10(&parse, p);
-            let v = if v == i64::MAX || v == i64::MIN {
+            let v = if v == i64::MAX || v == i64::MIN || v > i32::MAX as i64 || v < i32::MIN as i64 {
                 -1
             } else {
                 v
             };
             self.csiescseq.arg[narg] = v as i32;
+            self.csiescseq.sub[narg] = next_sub;
             narg += 1;
-            p = if np == p {
-                // no digits: strtol leaves the pointer alone
-                p
-            } else {
-                np
-            };
-            if p < parse.len() && sep == b';' && parse[p] == b':' {
-                sep = b':';
-            }
-            if p >= parse.len() || parse[p] != sep || narg == ESC_ARG_SIZ {
+            p = np;
+            if p >= len || narg == ESC_ARG_SIZ {
                 break;
+            }
+            match parse[p] {
+                b';' => next_sub = false,
+                b':' => next_sub = true,
+                _ => break,
             }
             p += 1;
         }
@@ -1559,21 +1607,34 @@ impl App {
         self.csidump();
     }
 
-    pub fn tdefcolor(&mut self, attr: &[i32], npar: &mut usize, l: usize) -> i32 {
+    /// Parse an extended colour (`38`, `48`, `58`) starting at `attr[*npar]`
+    /// and leave `*npar` on its last argument.  Both the `;` form
+    /// (`38;2;r;g;b`, `38;5;n`) and the `:` form (`38:2::r:g:b`,
+    /// `38:2:id:r:g:b`, `38:5:n`) are accepted.
+    pub fn tdefcolor(&mut self, attr: &[i32], sub: &[bool], npar: &mut usize, l: usize) -> i32 {
         let mut idx: i32 = -1;
+
+        let colon = sub.get(*npar + 1).copied().unwrap_or(false);
+        // Number of `:` sub-parameters following the attribute.
+        let nsub = sub[*npar + 1..l.min(sub.len())]
+            .iter()
+            .take_while(|&&b| b)
+            .count();
 
         let kind = attr.get(*npar + 1).copied().unwrap_or(0);
         match kind {
             2 => {
-                // direct color in RGB space
-                if *npar + 4 >= l {
+                // direct color in RGB space; the colon form may carry a
+                // colour-space id before the components.
+                let skip = if colon && nsub >= 5 { 1 } else { 0 };
+                if *npar + 4 + skip >= l {
                     eprintln!("erresc(38): Incorrect number of parameters ({})", *npar);
                     return idx;
                 }
-                let r = attr[*npar + 2] as u32;
-                let g = attr[*npar + 3] as u32;
-                let b = attr[*npar + 4] as u32;
-                *npar += 4;
+                let r = attr[*npar + 2 + skip] as u32;
+                let g = attr[*npar + 3 + skip] as u32;
+                let b = attr[*npar + 4 + skip] as u32;
+                *npar += 4 + skip;
                 if !(0..=255).contains(&r) || !(0..=255).contains(&g) || !(0..=255).contains(&b) {
                     eprintln!("erresc: bad rgb color ({},{},{})", r, g, b);
                 } else {
@@ -1605,8 +1666,9 @@ impl App {
         idx
     }
 
-    pub fn tsetattr(&mut self, attr: &[i32]) {
+    pub fn tsetattr(&mut self, attr: &[i32], sub: &[bool]) {
         let l = attr.len();
+        let issub = |j: usize| sub.get(j).copied().unwrap_or(false);
         let mut i = 0usize;
         while i < l {
             match attr[i] {
@@ -1621,40 +1683,61 @@ impl App {
                         | ATTR_STRUCK);
                     self.term.c.attr.fg = DEFAULTFG;
                     self.term.c.attr.bg = DEFAULTBG;
+                    self.term.c.attr.ustyle = UL_NONE;
+                    self.term.c.attr.ucolor = 0;
                 }
                 1 => self.term.c.attr.mode |= ATTR_BOLD,
                 2 => self.term.c.attr.mode |= ATTR_FAINT,
                 3 => self.term.c.attr.mode |= ATTR_ITALIC,
-                4 => self.term.c.attr.mode |= ATTR_UNDERLINE,
+                4 => {
+                    // `4:n` selects an underline style, plain `4` a single one.
+                    let style = if issub(i + 1) {
+                        match attr[i + 1] {
+                            0 => UL_NONE,
+                            2 => UL_DOUBLE,
+                            3 => UL_CURLY,
+                            4 => UL_DOTTED,
+                            5 => UL_DASHED,
+                            _ => UL_SINGLE,
+                        }
+                    } else {
+                        UL_SINGLE
+                    };
+                    self.setunderline(style);
+                }
+                21 => self.setunderline(UL_DOUBLE),
                 5 | 6 => self.term.c.attr.mode |= ATTR_BLINK,
                 7 => self.term.c.attr.mode |= ATTR_REVERSE,
                 8 => self.term.c.attr.mode |= ATTR_INVISIBLE,
                 9 => self.term.c.attr.mode |= ATTR_STRUCK,
                 22 => self.term.c.attr.mode &= !(ATTR_BOLD | ATTR_FAINT),
                 23 => self.term.c.attr.mode &= !ATTR_ITALIC,
-                24 => self.term.c.attr.mode &= !ATTR_UNDERLINE,
+                24 => self.setunderline(UL_NONE),
                 25 => self.term.c.attr.mode &= !ATTR_BLINK,
                 27 => self.term.c.attr.mode &= !ATTR_REVERSE,
                 28 => self.term.c.attr.mode &= !ATTR_INVISIBLE,
                 29 => self.term.c.attr.mode &= !ATTR_STRUCK,
                 38 => {
-                    let idx = self.tdefcolor(attr, &mut i, l);
+                    let idx = self.tdefcolor(attr, sub, &mut i, l);
                     if idx >= 0 {
                         self.term.c.attr.fg = idx as u32;
                     }
                 }
                 39 => self.term.c.attr.fg = DEFAULTFG,
                 48 => {
-                    let idx = self.tdefcolor(attr, &mut i, l);
+                    let idx = self.tdefcolor(attr, sub, &mut i, l);
                     if idx >= 0 {
                         self.term.c.attr.bg = idx as u32;
                     }
                 }
                 49 => self.term.c.attr.bg = DEFAULTBG,
                 58 => {
-                    // underline colour: parsed and discarded
-                    self.tdefcolor(attr, &mut i, l);
+                    let idx = self.tdefcolor(attr, sub, &mut i, l);
+                    if idx >= 0 {
+                        self.term.c.attr.ucolor = idx as u32 | UCOLOR_SET;
+                    }
                 }
+                59 => self.term.c.attr.ucolor = 0,
                 a => {
                     if between(a, 30, 37) {
                         self.term.c.attr.fg = (a - 30) as u32;
@@ -1671,7 +1754,20 @@ impl App {
                 }
             }
             i += 1;
+            // Sub-parameters nobody consumed belong to the attribute above.
+            while i < l && issub(i) {
+                i += 1;
+            }
         }
+    }
+
+    fn setunderline(&mut self, style: u8) {
+        self.term.c.attr.ustyle = style;
+        self.term.c.attr.mode = if style == UL_NONE {
+            self.term.c.attr.mode & !ATTR_UNDERLINE
+        } else {
+            self.term.c.attr.mode | ATTR_UNDERLINE
+        };
     }
 
     pub fn tsetscroll(&mut self, t: i32, b: i32) {
@@ -1759,6 +1855,7 @@ impl App {
                         CursorMovement::Load
                     }),
                     2004 => self.xsetmode(set != 0, MODE_BRCKTPASTE),
+                    2026 => self.tsetsync(set != 0),
                     1001 | 1005 | 1015 => {}
                     _ => eprintln!("erresc: unknown private set/reset mode {}", arg),
                 }
@@ -1775,12 +1872,101 @@ impl App {
         }
     }
 
+    /// Synchronized output (mode 2026): hold drawing until it is reset or
+    /// `SYNCTIMEOUT` passes.
+    pub fn tsetsync(&mut self, set: bool) {
+        if set {
+            if !self.is_set(MODE_SYNC) {
+                self.sync_since = Some(std::time::Instant::now());
+            }
+            self.term.mode |= MODE_SYNC;
+        } else {
+            self.term.mode &= !MODE_SYNC;
+            self.sync_since = None;
+        }
+    }
+
+    /// Whether drawing is currently held back by synchronized output, and
+    /// for how many more milliseconds.  Expired holds are dropped.
+    pub fn sync_pending(&mut self, now: std::time::Instant) -> Option<f64> {
+        let since = self.sync_since?;
+        let elapsed = now.saturating_duration_since(since).as_millis() as f64;
+        if self.is_set(MODE_SYNC) && elapsed < config::SYNCTIMEOUT {
+            Some(config::SYNCTIMEOUT - elapsed)
+        } else {
+            self.tsetsync(false);
+            None
+        }
+    }
+
+    /// DECRQM answer for a mode: 1 set, 2 reset, 4 permanently reset,
+    /// 0 not recognised.
+    pub fn mode_state(&self, priv_: bool, n: i32) -> u8 {
+        let b = |on: bool| if on { 1 } else { 2 };
+        if priv_ {
+            match n {
+                1 => b(self.win_is_set(MODE_APPCURSOR)),
+                5 => b(self.win_is_set(MODE_REVERSE)),
+                6 => b(self.term.c.state & CURSOR_ORIGIN != 0),
+                7 => b(self.is_set(MODE_WRAP)),
+                9 => b(self.win_is_set(MODE_MOUSEX10)),
+                25 => b(!self.win_is_set(MODE_HIDE)),
+                47 | 1047 | 1049 => b(self.is_set(MODE_ALTSCREEN)),
+                1000 => b(self.win_is_set(MODE_MOUSEBTN)),
+                1002 => b(self.win_is_set(MODE_MOUSEMOTION)),
+                1003 => b(self.win_is_set(MODE_MOUSEMANY)),
+                1004 => b(self.win_is_set(MODE_FOCUS)),
+                1006 => b(self.win_is_set(MODE_MOUSESGR)),
+                1034 => b(self.win_is_set(MODE_8BIT)),
+                2004 => b(self.win_is_set(MODE_BRCKTPASTE)),
+                2026 => b(self.is_set(MODE_SYNC)),
+                1001 | 1005 | 1015 => 4,
+                _ => 0,
+            }
+        } else {
+            match n {
+                2 => b(self.win_is_set(MODE_KBDLOCK)),
+                4 => b(self.is_set(MODE_INSERT)),
+                12 => b(!self.is_set(MODE_ECHO)),
+                20 => b(self.is_set(MODE_CRLF)),
+                _ => 0,
+            }
+        }
+    }
+
+    /// CSI sequences with a `>`, `=` or `<` parameter prefix.  Only the
+    /// queries are answered; settings such as xterm's modifyOtherKeys
+    /// (`CSI > 4 ; 1 m`) or the kitty keyboard protocol (`CSI > 1 u`) are
+    /// ignored so they cannot be mistaken for SGR or cursor restore.
+    fn csihandle_prefixed(&mut self) {
+        let prefix = self.csiescseq.prefix;
+        let arg0 = self.csiescseq.arg[0];
+        match (prefix, self.csiescseq.mode[0]) {
+            (b'>', b'c') if arg0 == 0 => {
+                // DA2 -- Secondary Device Attributes
+                self.ttywrite(config::VTIDEN2, false);
+            }
+            (b'>', b'q') if arg0 == 0 => {
+                // XTVERSION
+                let buf = format!("\x1bP>|st {}-rs\x1b\\", env!("CARGO_PKG_VERSION"));
+                self.ttywrite(buf.as_bytes(), false);
+            }
+            (b'>', b'm') | (b'>', b'n') | (b'>', b'u') | (b'<', b'u') | (b'=', b'u') => {}
+            _ => self.csi_unknown(),
+        }
+    }
+
     pub fn csihandle(&mut self) {
         let mode0 = self.csiescseq.mode[0];
         let arg0 = self.csiescseq.arg[0];
         let arg1 = self.csiescseq.arg[1];
         let narg = self.csiescseq.narg;
         let priv_ = self.csiescseq.priv_ != 0;
+
+        if matches!(self.csiescseq.prefix, b'>' | b'=' | b'<') {
+            self.csihandle_prefixed();
+            return;
+        }
 
         match mode0 {
             b'@' => {
@@ -1975,7 +2161,8 @@ impl App {
             b'm' => {
                 // SGR
                 let a = self.csiescseq.arg[..narg].to_vec();
-                self.tsetattr(&a);
+                let sub = self.csiescseq.sub[..narg].to_vec();
+                self.tsetattr(&a, &sub);
             }
             b'n' => {
                 // DSR
@@ -2007,6 +2194,20 @@ impl App {
                     self.tcursor(CursorMovement::Load);
                 }
             }
+            b'$' => match self.csiescseq.mode[1] {
+                b'p' => {
+                    // DECRQM -- request mode
+                    let st = self.mode_state(priv_, arg0);
+                    let buf = format!(
+                        "\x1b[{}{};{}$y",
+                        if priv_ { "?" } else { "" },
+                        arg0,
+                        st
+                    );
+                    self.ttywrite(buf.as_bytes(), false);
+                }
+                _ => self.csi_unknown(),
+            },
             b' ' => match self.csiescseq.mode[1] {
                 b'q' => {
                     // DECSCUSR
@@ -2234,8 +2435,16 @@ impl App {
                 self.xsettitle(a);
                 return;
             }
-            b'P' | b'_' | b'^' => {
-                // DCS / APC / PM
+            b'P' => {
+                // DCS: only XTGETTCAP (`DCS + q Pt ST`) is answered.
+                let data = self.strescseq.buf[..self.strescseq.len].to_vec();
+                if let Some(names) = data.strip_prefix(b"+q") {
+                    self.xtgettcap(names);
+                }
+                return;
+            }
+            b'_' | b'^' => {
+                // APC / PM
                 return;
             }
             _ => {}
@@ -2243,6 +2452,23 @@ impl App {
 
         eprint!("erresc: unknown str ");
         self.strdump();
+    }
+
+    /// XTGETTCAP: answer each hex-encoded capability name in `names`
+    /// (separated by `;`) with its terminfo value.
+    fn xtgettcap(&mut self, names: &[u8]) {
+        for hexname in names.split(|&b| b == b';') {
+            let reply = match hexdecode(hexname).and_then(|n| tcap_value(&n)) {
+                Some(Some(v)) => format!(
+                    "\x1bP1+r{}={}\x1b\\",
+                    String::from_utf8_lossy(hexname),
+                    hexencode(v.as_bytes())
+                ),
+                Some(None) => format!("\x1bP1+r{}\x1b\\", String::from_utf8_lossy(hexname)),
+                None => format!("\x1bP0+r{}\x1b\\", String::from_utf8_lossy(hexname)),
+            };
+            self.ttywrite(reply.as_bytes(), false);
+        }
     }
 
     pub fn tstrsequence(&mut self, c: u8) {
@@ -2640,6 +2866,7 @@ impl App {
             fg: self.term.c.attr.fg,
             bg: self.term.c.attr.bg,
             mode: ATTR_NULL,
+            ..Glyph::default()
         };
         for line in self.term.hist.iter_mut() {
             line.resize(col as usize, blank);
@@ -2762,6 +2989,7 @@ impl App {
             fg: DEFAULTFG,
             bg: DEFAULTBG,
             mode: ATTR_NULL,
+            ..Glyph::default()
         };
         let mut rows: Vec<Line> = Vec::new();
         let mut cur_abs_row = 0usize;
@@ -3798,5 +4026,145 @@ mod tests {
             assert_eq!(app.win.cursor, style as u32, "DECSCUSR {}", style);
         }
         assert!(!app.cursorblinks);
+    }
+
+    #[test]
+    fn csi_subparameters_and_prefixes() {
+        let mut app = new_app(20, 3);
+        app.csiescseq.buf[..9].copy_from_slice(b"4:3;38:5m");
+        app.csiescseq.len = 9;
+        app.csiparse();
+        assert_eq!(&app.csiescseq.arg[..4], &[4, 3, 38, 5]);
+        assert_eq!(&app.csiescseq.sub[..4], &[false, true, false, true]);
+        assert_eq!(app.csiescseq.mode[0], b'm');
+
+        app.csireset();
+        app.csiescseq.buf[..2].copy_from_slice(b">q");
+        app.csiescseq.len = 2;
+        app.csiparse();
+        assert_eq!(app.csiescseq.prefix, b'>');
+        assert_eq!(app.csiescseq.priv_, 0);
+        assert_eq!(app.csiescseq.mode[0], b'q');
+    }
+
+    #[test]
+    fn sgr_colon_and_semicolon_colours() {
+        let mut app = new_app(20, 3);
+        feed(&mut app, b"\x1b[38:2::1:2:3mA\x1b[38:2:0:4:5:6mB\x1b[38;2;7;8;9mC\x1b[38:5:42mD");
+        assert_eq!(cell(&app, 0, 0).fg, truecolor(1, 2, 3));
+        assert_eq!(cell(&app, 1, 0).fg, truecolor(4, 5, 6));
+        assert_eq!(cell(&app, 2, 0).fg, truecolor(7, 8, 9));
+        assert_eq!(cell(&app, 3, 0).fg, 42);
+        // Mixed: colour sub-parameters must not leak into the next attribute.
+        feed(&mut app, b"\x1b[0;38:2::10:20:30;1mE");
+        let g = cell(&app, 4, 0);
+        assert_eq!(g.fg, truecolor(10, 20, 30));
+        assert_ne!(g.mode & ATTR_BOLD, 0);
+        assert_eq!(g.mode & ATTR_ITALIC, 0);
+    }
+
+    #[test]
+    fn underline_styles_and_colour() {
+        let mut app = new_app(20, 3);
+        feed(&mut app, b"\x1b[4mA\x1b[4:3mB\x1b[21mC\x1b[4:5;58:2::255:0:0mD\x1b[59mE\x1b[4:0mF\x1b[4m\x1b[24mG");
+        let st = |x| (cell(&app, x, 0).ustyle, cell(&app, x, 0).mode & ATTR_UNDERLINE != 0);
+        assert_eq!(st(0), (UL_SINGLE, true));
+        assert_eq!(st(1), (UL_CURLY, true));
+        assert_eq!(st(2), (UL_DOUBLE, true));
+        assert_eq!(st(3), (UL_DASHED, true));
+        assert_eq!(cell(&app, 3, 0).ucolor, truecolor(255, 0, 0) | UCOLOR_SET);
+        assert_eq!(cell(&app, 4, 0).ucolor, 0);
+        assert_eq!(st(5), (UL_NONE, false));
+        assert_eq!(st(6), (UL_NONE, false));
+        // `4:3` must not be read as underline + italic.
+        assert_eq!(cell(&app, 1, 0).mode & ATTR_ITALIC, 0);
+
+        feed(&mut app, b"\x1b[4:3;58;5;1m\x1b[0mH");
+        assert_eq!(cell(&app, 7, 0).ustyle, UL_NONE);
+        assert_eq!(cell(&app, 7, 0).ucolor, 0);
+
+        // Erasing resets the cell's underline attributes.
+        feed(&mut app, b"\x1b[4:3;58;5;1m\x1b[2J");
+        assert_eq!(cell(&app, 1, 0).ustyle, UL_NONE);
+        assert_eq!(cell(&app, 1, 0).ucolor, 0);
+    }
+
+    #[test]
+    fn prefixed_settings_are_not_sgr() {
+        let mut app = new_app(20, 3);
+        // xterm modifyOtherKeys: must not turn on underline.
+        feed(&mut app, b"\x1b[>4;1mA");
+        assert_eq!(cell(&app, 0, 0).mode & ATTR_UNDERLINE, 0);
+        // kitty keyboard query must not restore the cursor.
+        feed(&mut app, b"\x1b[s\x1b[1;5H\x1b[<uB");
+        assert_eq!(cell(&app, 4, 0).u, b'B' as Rune);
+    }
+
+    #[test]
+    fn device_queries() {
+        let mut app = new_app(20, 3);
+        feed(&mut app, b"\x1b[>c");
+        assert_eq!(app.test_out, config::VTIDEN2);
+        app.test_out.clear();
+        feed(&mut app, b"\x1b[c");
+        assert_eq!(app.test_out, config::VTIDEN);
+        app.test_out.clear();
+        feed(&mut app, b"\x1b[>q");
+        assert!(app.test_out.starts_with(b"\x1bP>|st "));
+        assert!(app.test_out.ends_with(b"\x1b\\"));
+    }
+
+    #[test]
+    fn decrqm_reports_modes() {
+        let mut app = new_app(20, 3);
+        feed(&mut app, b"\x1b[?2026$p");
+        assert_eq!(app.test_out, b"\x1b[?2026;2$y");
+        app.test_out.clear();
+        feed(&mut app, b"\x1b[?2026h\x1b[?2026$p\x1b[?7$p\x1b[?9999$p\x1b[4$p\x1b[?1015$p");
+        assert_eq!(
+            String::from_utf8_lossy(&app.test_out),
+            "\x1b[?2026;1$y\x1b[?7;1$y\x1b[?9999;0$y\x1b[4;2$y\x1b[?1015;4$y"
+        );
+    }
+
+    #[test]
+    fn synchronized_output_holds_and_expires() {
+        let mut app = new_app(20, 3);
+        let t0 = std::time::Instant::now();
+        assert!(app.sync_pending(t0).is_none());
+        feed(&mut app, b"\x1b[?2026h");
+        let since = app.sync_since.unwrap();
+        let wait = app.sync_pending(since).unwrap();
+        assert!(wait > 0.0 && wait <= config::SYNCTIMEOUT);
+        feed(&mut app, b"\x1b[?2026l");
+        assert!(app.sync_pending(since).is_none());
+        // A hold that is never released expires.
+        feed(&mut app, b"\x1b[?2026h");
+        let since = app.sync_since.unwrap();
+        let late = since + std::time::Duration::from_millis(config::SYNCTIMEOUT as u64 + 1);
+        assert!(app.sync_pending(late).is_none());
+        assert!(!app.is_set(MODE_SYNC));
+    }
+
+    #[test]
+    fn xtgettcap_answers() {
+        let mut app = new_app(20, 3);
+        // "TN" ; "Smulx" ; "zz" ; "RGB"
+        let q = format!(
+            "\x1bP+q{};{};{};{}\x1b\\",
+            hexencode(b"TN"),
+            hexencode(b"Smulx"),
+            hexencode(b"zz"),
+            hexencode(b"RGB")
+        );
+        feed(&mut app, q.as_bytes());
+        let out = String::from_utf8_lossy(&app.test_out).into_owned();
+        let tn = format!("\x1bP1+r{}={}\x1b\\", hexencode(b"TN"), hexencode(config::TERMNAME.as_bytes()));
+        assert!(out.contains(&tn), "{:?}", out);
+        assert!(out.contains(&format!("\x1bP1+r{}={}\x1b\\", hexencode(b"Smulx"), hexencode(b"\x1b[4:%p1%dm"))));
+        assert!(out.contains(&format!("\x1bP0+r{}\x1b\\", hexencode(b"zz"))));
+        assert!(out.contains(&format!("\x1bP1+r{}\x1b\\", hexencode(b"RGB"))));
+        assert_eq!(hexdecode(b"544E"), Some(b"TN".to_vec()));
+        assert_eq!(hexdecode(b"5"), None);
     }
 }

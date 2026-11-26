@@ -5,6 +5,7 @@
 mod app;
 mod config;
 mod ffi;
+mod search;
 mod icon;
 mod term;
 mod x;
