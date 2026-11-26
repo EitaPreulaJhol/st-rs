@@ -4,9 +4,12 @@
 Usage:
     xwd.py different A.xwd B.xwd MIN_PIXELS
     xwd.py pixel A.xwd X Y
+    xwd.py darkrow A.xwd X0 X1 Y0 Y1
 
 `different` exits 0 when at least MIN_PIXELS differ.
 `pixel` prints "r g b a" (0-255) for one pixel.
+`darkrow` exits 0 when some row between Y0 and Y1 is dark from X0 to X1
+(inclusive), i.e. a horizontal line crosses the whole span without gaps.
 """
 
 import struct
@@ -110,6 +113,26 @@ def main(argv):
         print(scale(img["rmask"], p), scale(img["gmask"], p),
               scale(img["bmask"], p), alpha)
         return 0
+
+    if len(argv) == 7 and argv[1] == "darkrow":
+        img = load(argv[2])
+        x0, x1, y0, y1 = (int(v) for v in argv[3:7])
+        for y in range(y0, y1 + 1):
+            row = img["px"][y * img["bpl"]:y * img["bpl"] +
+                           img["w"] * (img["bpp"] // 8)]
+            dark = True
+            for x in range(x0, x1 + 1):
+                p = pixel(img, row, x)
+                lum = (scale(img["rmask"], p) + scale(img["gmask"], p) +
+                       scale(img["bmask"], p)) / 3
+                if lum >= 128:
+                    dark = False
+                    break
+            if dark:
+                print(f"row {y} is dark from {x0} to {x1}")
+                return 0
+        print(f"no dark row between {y0} and {y1} spans {x0}..{x1}")
+        return 1
 
     print(__doc__)
     return 2

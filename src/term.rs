@@ -852,7 +852,13 @@ impl App {
         let dir = self
             .newterm_dir()
             .and_then(|d| CString::new(d.as_os_str().as_bytes()).ok());
-        let exe = CString::new("/proc/self/exe").unwrap();
+        // The binary's own path keeps the process name "st"; /proc/self/exe
+        // still works if the file was replaced since it started.
+        let exe = std::env::current_exe()
+            .ok()
+            .filter(|p| p.is_file())
+            .and_then(|p| CString::new(p.as_os_str().as_bytes()).ok())
+            .unwrap_or_else(|| CString::new("/proc/self/exe").unwrap());
         let args = self.newterm_args();
         let mut argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
         argv.push(ptr::null());

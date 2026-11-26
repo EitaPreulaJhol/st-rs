@@ -213,6 +213,100 @@ punctuation is included only if `URLCHARS` allows it (`,` and `;` are valid URL
 characters and therefore part of the URL). `Ctrl+Click` anywhere else does
 nothing.
 
+### Hyperlinks (OSC 8)
+
+Programs can attach a link to text with OSC 8
+(`ESC ] 8 ; params ; URI ST` … `ESC ] 8 ; ; ST`), as `ls --hyperlink=auto`,
+GCC diagnostics, systemd and many others do. Linked text looks normal; while
+`Ctrl` is held it is underlined together with the detected URLs, and
+`Ctrl+Click` opens its URI with `URLHANDLER`, whatever the scheme (`file://`
+included). Links with the same `id=` and URI share one entry; up to `LINKMAX`
+(4096) are kept and the ones no longer on screen or in the history are
+dropped when the table fills up.
+
+### Scrollback search
+
+`Ctrl+Shift+F` opens a search bar over the last row. Matches in the history
+and on the screen are highlighted as you type:
+
+* `Enter` / `Up` jumps to the previous (older) match, `Shift+Enter` / `Down` to
+  the next one; both wrap around and scroll the view to the match.
+* `Backspace`, `Ctrl+U` (clear) and `Ctrl+W` (delete word) edit the query.
+* `Esc` closes the bar, keeps the view where it is and selects the current
+  match into PRIMARY, so `Ctrl+Shift+C` copies it.
+
+The search ignores case unless the query contains a capital letter, and it
+works on logical lines, so text that was soft-wrapped across rows is found.
+New output keeps the current match in place. The prompt and colours are
+`SEARCH_PROMPT` and `SEARCH_*` in `src/config.rs`.
+
+### New terminal in the current directory
+
+`Ctrl+Shift+Enter` opens another st window in the current directory. The
+directory is the one the shell last reported with OSC 7, or else the working
+directory of the foreground process (`/proc/<pid>/cwd`), which works without any
+shell setup. OSC 7 reports from other hosts (a shell behind ssh) are ignored.
+The new window gets this one's `-f`, `-c`, `-A` and `-a` options.
+
+Most shells can send OSC 7 from their prompt:
+
+```sh
+# bash (~/.bashrc)
+PROMPT_COMMAND='printf "\033]7;file://%s%s\033\\" "$HOSTNAME" "$PWD"'${PROMPT_COMMAND:+";$PROMPT_COMMAND"}
+
+# zsh (~/.zshrc)
+autoload -Uz add-zsh-hook
+_osc7() { printf '\033]7;file://%s%s\033\\' "$HOST" "$PWD" }
+add-zsh-hook chpwd _osc7; _osc7
+```
+
+fish sends OSC 7 by itself. Paths with unusual characters may be
+percent-encoded; st decodes `%xx`.
+
+### Underline styles
+
+Besides the plain underline (SGR 4), applications can ask for double (`4:2`
+or SGR 21), curly (`4:3`), dotted (`4:4`) and dashed (`4:5`) underlines, and
+colour them independently of the text with SGR 58 (`58:2::r:g:b`, `58;5;n`,
+…; SGR 59 resets it). Editors use this for spelling and LSP diagnostics. CSI
+parameters keep their `:` sub-parameter structure, so `38:2::r:g:b` colours
+work as well as `38;2;r;g;b`.
+
+The `st-256color` terminfo entry (`st.info`) advertises these with `Smulx`,
+`Setulc` and `Su`. If you use another `TERMNAME` (for example
+`xterm-256color`), Neovim and Vim may need to be told about undercurl
+themselves; Neovim can also find out through XTGETTCAP (below).
+
+### Box drawing
+
+Box-drawing characters (U+2500–U+257F: light, heavy, double and dashed lines
+and their junctions) and block elements (U+2580–U+259F: halves, eighths,
+quadrants and the `░▒▓` shades) are drawn by st with rectangles that reach the
+cell edges, so frames from `htop`, `tmux`, `mc` or `btop` join without gaps at
+any font and zoom. Rounded corners are drawn square and the diagonals
+(U+2571–U+2573) still come from the font. Set `BOXDRAW = false` to use the
+font for everything.
+
+### Synchronized output and queries
+
+Applications can bracket a redraw with mode 2026 (`CSI ? 2026 h` … `CSI ? 2026
+l`); st then holds the screen until the update is complete, so full-screen
+programs do not flicker or tear. A hold that is never released ends after
+`SYNCTIMEOUT` (150 ms).
+
+st also answers the queries programs use to discover these features:
+
+| Query | Reply |
+| --- | --- |
+| DECRQM, `CSI ? Ps $ p` / `CSI Ps $ p` | `CSI ? Ps ; Pm $ y` (1 set, 2 reset, 4 permanently reset, 0 unknown) |
+| DA2, `CSI > c` | `VTIDEN2` (`CSI > 1 ; 903 ; 0 c`) |
+| XTVERSION, `CSI > q` | `DCS > \| st 0.9.3-rs ST` |
+| XTGETTCAP, `DCS + q <hex names> ST` | `TN`, `Co`, `RGB`, `Tc`, `Su`, `Smulx`, `Setulc`, `Sync`, `Ss`, `Se` |
+
+Other sequences with a `>`, `=` or `<` prefix (xterm's modifyOtherKeys,
+the kitty keyboard protocol) are ignored instead of being misread as SGR or
+cursor commands.
+
 ### Drag and drop
 
 Dropping files (`text/uri-list`) or plain text (`text/plain`) from another X
@@ -265,8 +359,12 @@ The suite covers:
   text output, wrapping, wide characters, tabs, scrolling, alternate screen,
   erase modes, SGR/256/true colour, scrollback history/viewport/selection,
   selection snapping/rectangular/wrapped selections, reflow on width changes
-  (wrapping, unwrapping, history, wide characters), resize fuzzing, and
-  selections surviving (or being cleared on) resize.
+  (wrapping, unwrapping, history, wide characters), resize fuzzing,
+  selections surviving (or being cleared on) resize, CSI sub-parameters and
+  prefixes, underline styles and colours, OSC 8 links and their table, OSC 7,
+  DECRQM/DA2/XTVERSION/XTGETTCAP replies, synchronized output, box-drawing
+  geometry, search matching (smart case, wrapped lines, wide characters) and
+  navigation, and the new-terminal directory and arguments.
 * Rendering: screenshots of the configured font, an explicit font, and a zoomed
   terminal exercise bold/faint/italic/underline/struck/reverse/invisible
   attributes, palette/true colour cells, DEC line drawing, wide characters and
@@ -283,6 +381,14 @@ The suite covers:
   configured limits, and reset.
 * Custom per-style fonts: a variant is built with DejaVu bold/italic patterns,
   rendered, compared against the derived-style build, and zoomed.
+* Box drawing: a row of `─` is checked pixel by pixel to be continuous across
+  cells; underline styles, double frames, shades and an OSC 8 link are part of
+  the rendering screenshots.
+* Terminal queries: DECRQM, DA2 and XTGETTCAP replies are read back through
+  the pty.
+* Scrollback search: `Ctrl+Shift+F`, typing a query and `Esc` leave the view
+  on a match in the history.
+* `Ctrl+Shift+Enter` starts a new st whose working directory is the shell's.
 
 ## Source layout
 
@@ -294,6 +400,8 @@ The suite covers:
 | `src/x.rs` | X11 frontend: window, events, fonts, colours, drawing, clipboard |
 | `src/config.rs` | configuration, generated from the original `config.h` |
 | `src/icon.rs` | the 16x16 and 32x32 images published as `_NET_WM_ICON` |
+| `src/boxdraw.rs` | rectangles for box-drawing characters and block elements |
+| `src/search.rs` | scrollback search: matcher, keys, highlights and search bar |
 | `src/ffi.rs` | fontconfig bindings and variadic Xlib entry points |
 
 The C globals (`term`, `sel`, `win`, `xw`, `dc`, …) live in one `App` value.
@@ -338,6 +446,15 @@ destroy callbacks can reach the state; the rest is regular Rust ownership.
   `THEME` to `DARK_THEME` in `src/config.rs` for the original st colours. The
   window also publishes a simple terminal `_NET_WM_ICON` in two sizes for
   task switchers and panels.
+* Styled/coloured underlines, OSC 8 hyperlinks, OSC 7, synchronized output
+  (mode 2026) and the DECRQM, DA2, XTVERSION and XTGETTCAP queries are
+  supported; the original ignores them (and reads `4:3` as underline plus
+  italic). CSI sequences with a `>`, `=` or `<` prefix are only answered when
+  they are queries.
+* Box-drawing characters and block elements are drawn natively, as in the
+  `boxdraw` patch (`BOXDRAW`).
+* `Ctrl+Shift+F` searches the scrollback and `Ctrl+Shift+Enter` opens a new
+  terminal in the current directory, as in the `newterm` patch.
 * Colours are allocated per drawn true-colour/derived attribute exactly as in
   the original (including the original's small Xft colour leak).
 

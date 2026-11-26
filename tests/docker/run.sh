@@ -4,7 +4,8 @@
 #
 # Runs headless inside the Docker test image: unit tests, rendering smoke
 # checks, configured hotkeys, scrollback, selection/clipboard/bracketed paste,
-# runtime zoom and custom per-style fonts. Xvfb provides a private display;
+# runtime zoom, box drawing, terminal queries, scrollback search, new
+# terminals in the current directory and custom per-style fonts. Xvfb provides a private display;
 # nothing is shown on the host desktop.
 
 set -euo pipefail
@@ -450,6 +451,161 @@ zoom_test() {
 
 step "runtime font zoom: Ctrl+Plus/Minus/0, limits and reset"
 zoom_test "$BIN" zoom
+
+# ---------------------------------------------------------------------------
+# Box drawing
+# ---------------------------------------------------------------------------
+
+boxdraw_test() {
+	local widf="$WORK/wid_box" sizef="$WORK/size_box" errf="$WORK/box_err"
+	local xwdf="$SHOTS/boxdraw.xwd"
+	rm -f "$widf" "$sizef" "$errf" "$xwdf"
+	# A row of U+2500 across the whole second line, dark on white.
+	"$BIN" -g 20x3 -A 1 -f "$DEFAULT_FONT" -e sh -c \
+		"echo \$WINDOWID > '$widf'; stty size > '$sizef'; printf '\033[2 q\033]10;#000000\007\033]11;#ffffff\007\033[2;1H'; i=0; while [ \$i -lt 20 ]; do printf '\342\224\200'; i=\$((i+1)); done; printf '\033[3;1H'; sleep 30" \
+		>/dev/null 2>"$errf" &
+	local pid=$!
+	wait_file "$widf" || { cat "$errf"; fail "boxdraw test did not start"; }
+	wait_file "$sizef" || fail "no tty size (boxdraw)"
+	local wid rows cols
+	wid=$(cat "$widf")
+	read -r rows cols <"$sizef"
+	"$XTOOL" focus "$wid"
+	sleep 0.6
+	xwd -id "$wid" -silent -out "$xwdf"
+	local geom w h
+	geom=$(xwininfo -id "$wid")
+	w=$(printf '%s\n' "$geom" | awk '/Width:/ {print $2}')
+	h=$(printf '%s\n' "$geom" | awk '/Height:/ {print $2}')
+	local cw=$(((w - 4) / cols)) ch=$(((h - 4) / rows))
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+	[ ! -s "$errf" ] || { cat "$errf"; fail "stderr from boxdraw test"; }
+	python3 tests/docker/xwd.py darkrow "$xwdf" 2 $((2 + 20 * cw - 1)) $((2 + ch)) $((2 + 2 * ch - 1)) ||
+		fail "box-drawing line has gaps between cells"
+}
+
+step "box-drawing characters join across cells"
+boxdraw_test
+
+# ---------------------------------------------------------------------------
+# Terminal queries
+# ---------------------------------------------------------------------------
+
+query_test() { # TAG QUERY COUNT WANT
+	local tag=$1 query=$2 count=$3 want=$4
+	local widf="$WORK/wid_q_$tag" out="$WORK/q_$tag" errf="$WORK/q_err_$tag"
+	rm -f "$widf" "$out" "$errf"
+	"$BIN" -g 40x5 -e sh -c \
+		"stty raw -echo; echo \$WINDOWID > '$widf'; printf '$query'; dd bs=1 count=$count of='$out' 2>/dev/null; sleep 1" \
+		>/dev/null 2>"$errf" &
+	local pid=$!
+	wait_file "$widf" || { cat "$errf"; fail "query test did not start ($tag)"; }
+	wait_file "$out" || true
+	sleep 0.3
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+	printf "$want" >"$WORK/q_want_$tag"
+	cmp -s "$out" "$WORK/q_want_$tag" || {
+		echo "--- reply ($tag) ---"
+		od -c "$out" 2>/dev/null || true
+		fail "unexpected reply to $tag"
+	}
+	echo "ok: $tag"
+}
+
+step "terminal queries: DECRQM, DA2, XTGETTCAP"
+query_test decrqm '\033[?2026$p' 11 '\033[?2026;2$y'
+query_test decrqm-set '\033[?2026h\033[?2026$p' 11 '\033[?2026;1$y'
+query_test da2 '\033[>c' 12 '\033[>1;903;0c'
+# XTGETTCAP Co (436F) -> 256 (323536)
+query_test xtgettcap '\033P+q436F\033\\' 18 '\033P1+r436F=323536\033\\'
+
+# ---------------------------------------------------------------------------
+# Scrollback search
+# ---------------------------------------------------------------------------
+
+search_test() {
+	local widf="$WORK/wid_search" readyf="$WORK/ready_search"
+	local dump="$WORK/search" errf="$WORK/search_err"
+	rm -f "$widf" "$readyf" "$dump" "$errf"
+	"$BIN" -g 20x5 -o "$dump" -e sh -c \
+		"echo \$WINDOWID > '$widf'; i=1; while [ \$i -le 40 ]; do printf 'line%02d\r\n' \$i; i=\$((i+1)); done; echo ready > '$readyf'; sleep 30" \
+		>/dev/null 2>"$errf" &
+	local pid=$!
+	wait_file "$widf" || { cat "$errf"; fail "search test did not start"; }
+	wait_file "$readyf" || { cat "$errf"; fail "search output did not finish"; }
+	local wid
+	wid=$(cat "$widf")
+	"$XTOOL" focus "$wid"
+	sleep 0.3
+	local base
+	base=$(stat -c %s "$dump")
+	"$XTOOL" key "$wid" cs F
+	sleep 0.2
+	"$XTOOL" type "$wid" "line07"
+	sleep 0.3
+	"$XTOOL" key "$wid" "" Escape
+	sleep 0.3
+	"$XTOOL" key "$wid" s Print
+	for _ in $(seq 1 60); do
+		[ "$(stat -c %s "$dump" 2>/dev/null || echo "$base")" -gt "$base" ] && break
+		sleep 0.05
+	done
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+	[ ! -s "$errf" ] || { cat "$errf"; fail "stderr from search test"; }
+	tail -c +$((base + 1)) "$dump" >"$WORK/search_view"
+	grep -q "line07" "$WORK/search_view" || {
+		echo "--- view after search ---"
+		cat "$WORK/search_view"
+		fail "search did not scroll to the match"
+	}
+	! grep -q "line40" "$WORK/search_view" || fail "search view still shows the live screen"
+}
+
+step "scrollback search: Ctrl+Shift+F scrolls to a match"
+search_test
+echo "search finds history lines"
+
+# ---------------------------------------------------------------------------
+# New terminal in the current directory
+# ---------------------------------------------------------------------------
+
+newterm_test() {
+	local widf="$WORK/wid_newterm" errf="$WORK/newterm_err" dir="$WORK/newterm dir"
+	mkdir -p "$dir"
+	rm -f "$widf" "$errf"
+	"$BIN" -g 40x5 -e sh -c "cd '$dir' && echo \$WINDOWID > '$widf' && sleep 30" \
+		>/dev/null 2>"$errf" &
+	local pid=$!
+	wait_file "$widf" || { cat "$errf"; fail "newterm test did not start"; }
+	local wid
+	wid=$(cat "$widf")
+	"$XTOOL" focus "$wid"
+	sleep 0.3
+	local before
+	before=$(pgrep -x st | sort)
+	"$XTOOL" key "$wid" cs Return
+	local newpid=""
+	for _ in $(seq 1 100); do
+		newpid=$(comm -13 <(printf '%s\n' "$before") <(pgrep -x st | sort) | head -n 1)
+		[ -n "$newpid" ] && break
+		sleep 0.05
+	done
+	[ -n "$newpid" ] || fail "Ctrl+Shift+Enter did not start a terminal"
+	sleep 0.3
+	local cwd
+	cwd=$(readlink "/proc/$newpid/cwd")
+	kill "$newpid" "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+	[ "$cwd" = "$dir" ] || fail "new terminal started in '$cwd', expected '$dir'"
+	[ ! -s "$errf" ] || { cat "$errf"; fail "stderr from newterm test"; }
+}
+
+step "Ctrl+Shift+Enter opens a terminal in the current directory"
+newterm_test
+echo "new terminal inherits the working directory"
 
 # ---------------------------------------------------------------------------
 # Custom per-style fonts

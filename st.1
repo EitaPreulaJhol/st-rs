@@ -180,6 +180,44 @@ Copy the selected text to the clipboard selection.
 .TP
 .B Ctrl-Shift-v
 Paste from the clipboard selection.
+.TP
+.B Ctrl-Shift-f
+Search the scrollback.  A search bar replaces the last row while the query is
+typed; matches are highlighted, the search ignores case unless the query
+contains a capital, and words wrapped across rows are found.
+.B Enter
+or
+.B Up
+moves to an older match,
+.B Shift-Enter
+or
+.B Down
+to a newer one,
+.B Backspace ,
+.B Ctrl-u
+and
+.B Ctrl-w
+edit the query, and
+.B Esc
+closes the bar, leaving the current match selected.
+.TP
+.B Ctrl-Shift-Enter
+Open a new st window in the current directory: the one the shell reported
+with OSC 7, or else the working directory of the foreground process.
+.TP
+.B Ctrl-Click
+Open the URL or OSC 8 hyperlink under the pointer.  Links are underlined while
+Ctrl is held.
+.SH ESCAPE SEQUENCES
+Besides the sequences of the original st,
+.B st
+understands styled and coloured underlines (SGR 4:0 to 4:5, 21, 58 and 59,
+with ITU T.416 colon sub-parameters), OSC 8 hyperlinks, OSC 7 working
+directory reports, synchronized output (mode 2026) and the queries DECRQM,
+DA2 (CSI > c), XTVERSION (CSI > q) and XTGETTCAP (DCS + q).
+Box-drawing characters and block elements are drawn by st itself unless
+.B BOXDRAW
+is turned off.
 .SH CUSTOMIZATION
 .B st
 can be customized by creating a custom config.h and (re)compiling the source
