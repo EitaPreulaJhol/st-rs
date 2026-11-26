@@ -506,6 +506,120 @@ fn findurlprefix(buf: &[u8], from: usize) -> Option<usize> {
     best
 }
 
+/// Most hyperlinks kept at once; when the table fills up, links no longer on
+/// screen or in the history are dropped.
+pub const LINKMAX: usize = 4096;
+
+/// The path of an OSC 7 `file://host/path` report, `%xx`-decoded.
+pub fn osc7_path(uri: &[u8]) -> Option<Vec<u8>> {
+    let rest = uri.strip_prefix(b"file://")?;
+    let slash = rest.iter().position(|&b| b == b'/')?;
+    let mut out = Vec::new();
+    let enc = &rest[slash..];
+    let mut i = 0;
+    while i < enc.len() {
+        if enc[i] == b'%' && i + 2 < enc.len() {
+            if let Some(v) = hexdecode(&enc[i + 1..i + 3]) {
+                out.push(v[0]);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(enc[i]);
+        i += 1;
+    }
+    if out.contains(&0) {
+        return None;
+    }
+    Some(out)
+}
+
+impl App {
+    /// Index in `links` for the OSC 8 link (`params`, `uri`); 0 ends the
+    /// current link.  Links with the same id and URI share an entry.
+    pub fn linkid(&mut self, params: &[u8], uri: &[u8]) -> u32 {
+        if uri.is_empty() {
+            return 0;
+        }
+        if self.links.is_empty() {
+            self.links.push(Vec::new()); // index 0: no link
+        }
+        let id = params
+            .split(|&b| b == b':')
+            .find_map(|p| p.strip_prefix(b"id="))
+            .unwrap_or(&[])
+            .to_vec();
+        let key = (id, uri.to_vec());
+        if let Some(&i) = self.linkids.get(&key) {
+            return i;
+        }
+        if self.links.len() >= LINKMAX {
+            self.compactlinks();
+            if self.links.len() >= LINKMAX {
+                return 0;
+            }
+        }
+        let i = self.links.len() as u32;
+        self.links.push(uri.to_vec());
+        self.linkids.insert(key, i);
+        i
+    }
+
+    /// Drop the links no cell refers to any more and renumber the rest.
+    pub fn compactlinks(&mut self) {
+        let n = self.links.len();
+        let mut used = vec![false; n];
+        used[0] = true;
+        let mark = |used: &mut Vec<bool>, g: &Glyph| {
+            if (g.link as usize) < used.len() {
+                used[g.link as usize] = true;
+            }
+        };
+        for line in self.term.line.iter().chain(self.term.alt.iter()).chain(self.term.hist.iter()) {
+            for g in line {
+                mark(&mut used, g);
+            }
+        }
+        mark(&mut used, &self.term.c.attr);
+        for c in &self.saved_cursors {
+            mark(&mut used, &c.attr);
+        }
+
+        let mut remap = vec![0u32; n];
+        let mut links = Vec::new();
+        for (i, l) in std::mem::take(&mut self.links).into_iter().enumerate() {
+            if used[i] {
+                remap[i] = links.len() as u32;
+                links.push(l);
+            }
+        }
+        let fix = |g: &mut Glyph| {
+            g.link = remap.get(g.link as usize).copied().unwrap_or(0);
+        };
+        for line in self
+            .term
+            .line
+            .iter_mut()
+            .chain(self.term.alt.iter_mut())
+            .chain(self.term.hist.iter_mut())
+        {
+            line.iter_mut().for_each(fix);
+        }
+        fix(&mut self.term.c.attr);
+        for c in self.saved_cursors.iter_mut() {
+            fix(&mut c.attr);
+        }
+        self.linkids = std::mem::take(&mut self.linkids)
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let nv = remap[v as usize];
+                (nv != 0).then_some((k, nv))
+            })
+            .collect();
+        self.links = links;
+    }
+}
+
 impl App {
     /// One byte per screen column for `row`: ASCII cells are copied verbatim,
     /// anything else (wide-character halves, CJK, emoji, empty cells) becomes
@@ -550,10 +664,26 @@ impl App {
         self.urlspans_in(&self.rowbytes(row))
     }
 
-    /// The URL covering column `col` on `row`, if any.
+    /// The OSC 8 link index of the cell at (row, col); the right half of a
+    /// wide character belongs to its left half.
+    fn link_at(&self, row: i32, col: i32) -> u32 {
+        let line = self.tline(row);
+        let mut c = col as usize;
+        if line[c].mode & ATTR_WDUMMY != 0 && c > 0 {
+            c -= 1;
+        }
+        line[c].link
+    }
+
+    /// The URL covering column `col` on `row`, if any: an OSC 8 hyperlink
+    /// first, then a URL recognised in the text.
     pub fn url_at(&self, row: i32, col: i32) -> Option<Vec<u8>> {
         if row < 0 || row >= self.term.row || col < 0 || col >= self.term.col {
             return None;
+        }
+        let link = self.link_at(row, col);
+        if link != 0 {
+            return self.links.get(link as usize).cloned();
         }
         let buf = self.rowbytes(row);
         for (start, end) in self.urlspans_in(&buf) {
@@ -569,7 +699,13 @@ impl App {
     /// keep dirtying the screen.
     pub fn highlighturls(&mut self) {
         for row in 0..self.term.row {
-            let spans = self.urlspans(row);
+            let mut spans = self.urlspans(row);
+            // OSC 8 hyperlinks: every cell that carries a link.
+            for c in 0..self.term.col {
+                if self.link_at(row, c) != 0 {
+                    spans.push((c, c + 1));
+                }
+            }
             if spans.is_empty() {
                 continue;
             }
@@ -614,8 +750,9 @@ impl App {
     /// Open the URL under (row, col) with `config::URLHANDLER`.
     pub fn followurl(&mut self, row: i32, col: i32) {
         let url = match self.url_at(row, col) {
-            Some(u) => u,
-            None => return,
+            // Never let a link pose as an option to the handler.
+            Some(u) if !u.is_empty() && u[0] != b'-' => u,
+            _ => return,
         };
 
         // Double fork, as in the C patch: the intermediate child is reaped
@@ -2336,6 +2473,26 @@ impl App {
                         if narg > 1 {
                             self.xsettitle(Some(&args[1]));
                         }
+                        return;
+                    }
+                    7 => {
+                        // current working directory: OSC 7 ; file://host/path
+                        let data = self.strescseq.buf[..self.strescseq.len].to_vec();
+                        if let Some(path) = data.get(2..).and_then(osc7_path) {
+                            self.cwd = Some(path);
+                        }
+                        return;
+                    }
+                    8 => {
+                        // hyperlink: OSC 8 ; params ; URI  (an empty URI ends it).
+                        // Split the raw buffer: the URI may contain `;`.
+                        let data = self.strescseq.buf[..self.strescseq.len].to_vec();
+                        let rest = data.get(2..).unwrap_or(&[]);
+                        let (params, uri) = match rest.iter().position(|&b| b == b';') {
+                            Some(i) => (&rest[..i], &rest[i + 1..]),
+                            None => (rest, &[][..]),
+                        };
+                        self.term.c.attr.link = self.linkid(params, uri);
                         return;
                     }
                     52 => {
@@ -4166,5 +4323,62 @@ mod tests {
         assert!(out.contains(&format!("\x1bP1+r{}\x1b\\", hexencode(b"RGB"))));
         assert_eq!(hexdecode(b"544E"), Some(b"TN".to_vec()));
         assert_eq!(hexdecode(b"5"), None);
+    }
+
+    #[test]
+    fn osc8_hyperlinks() {
+        let mut app = new_app(30, 3);
+        feed(&mut app, b"a\x1b]8;;http://x.test/a;b\x1b\\link\x1b]8;;\x1b\\ z");
+        assert_eq!(cell(&app, 0, 0).link, 0);
+        let l = cell(&app, 1, 0).link;
+        assert_ne!(l, 0);
+        for x in 1..5 {
+            assert_eq!(cell(&app, x, 0).link, l);
+        }
+        assert_eq!(cell(&app, 5, 0).link, 0);
+        assert_eq!(app.url_at(0, 2), Some(b"http://x.test/a;b".to_vec()));
+        assert_eq!(app.url_at(0, 6), None);
+
+        // Same id and URI share an entry; a different id does not.
+        feed(&mut app, b"\x1b]8;;http://x.test/a;b\x07Q\x1b]8;id=2;http://x.test/a;b\x07R\x1b]8;;\x07");
+        assert_eq!(cell(&app, 7, 0).link, l);
+        assert_ne!(cell(&app, 8, 0).link, l);
+
+        // Highlighting with Ctrl marks the linked cells.
+        app.highlighturls();
+        assert_ne!(cell(&app, 1, 0).mode & ATTR_URL, 0);
+        assert_eq!(cell(&app, 0, 0).mode & ATTR_URL, 0);
+        app.unhighlighturls();
+
+        // Erasing drops the link from the cells.
+        feed(&mut app, b"\x1b[2J");
+        assert_eq!(cell(&app, 1, 0).link, 0);
+    }
+
+    #[test]
+    fn hyperlink_table_is_compacted() {
+        let mut app = new_app(10, 2);
+        for i in 0..LINKMAX + 10 {
+            let s = format!("\x1b]8;;http://h/{}\x07x\x1b]8;;\x07\r", i);
+            feed(&mut app, s.as_bytes());
+        }
+        assert!(app.links.len() <= LINKMAX);
+        // The cell on screen still points at its own URI.
+        assert_eq!(app.url_at(0, 0), Some(format!("http://h/{}", LINKMAX + 9).into_bytes()));
+        // A link in the middle of being written survives compaction.
+        feed(&mut app, b"\x1b]8;;http://keep\x07");
+        app.compactlinks();
+        assert_eq!(app.links[app.term.c.attr.link as usize], b"http://keep");
+    }
+
+    #[test]
+    fn osc7_reports_the_directory() {
+        assert_eq!(osc7_path(b"file://host/home/me/a%20b"), Some(b"/home/me/a b".to_vec()));
+        assert_eq!(osc7_path(b"file:///tmp"), Some(b"/tmp".to_vec()));
+        assert_eq!(osc7_path(b"http://host/tmp"), None);
+        assert_eq!(osc7_path(b"file://host/a%00b"), None);
+        let mut app = new_app(10, 2);
+        feed(&mut app, b"\x1b]7;file://box/srv/x\x1b\\");
+        assert_eq!(app.cwd, Some(b"/srv/x".to_vec()));
     }
 }
