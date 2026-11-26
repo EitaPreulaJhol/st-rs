@@ -1,11 +1,33 @@
 # st - simple terminal (Rust port)
 
-A faithful Rust port of [st](https://st.suckless.org/) 0.9.3, the suckless
-simple terminal for X.
+st-rs is based on [st](https://st.suckless.org/) 0.9.3, the suckless simple
+terminal for X. It started as a faithful Rust port of the original C
+codebase: the same escape-sequence parser, screen/selection model, pty
+handling and X11 rendering through Xft, configured the same way by editing a
+source file and rebuilding.
 
-The emulator behaves like the original: the same escape-sequence parser,
-screen/selection model, pty handling, X11 rendering through Xft, etc. I've 
-added some modifications based on what I felt was missing.
+On top of the converted codebase, st-rs adds a number of features that the
+original st does not have (some of them are available there only as separate
+patches):
+
+* [Scrollback](#scrollback) with mouse wheel and keyboard navigation, and
+  [re-wrapping of the text](#scrollback) when the window is resized
+* [Scrollback search](#scrollback-search) (`Ctrl+Shift+F`)
+* [New terminal in the current directory](#new-terminal-in-the-current-directory)
+  (`Ctrl+Shift+Enter`)
+* [Clickable URLs](#urls) and [OSC 8 hyperlinks](#hyperlinks-osc-8)
+* [Styled and coloured underlines](#underline-styles) (curly, double, dotted,
+  dashed)
+* [Native box drawing](#box-drawing) without gaps between cells
+* [Synchronized output and terminal queries](#synchronized-output-and-queries)
+  (mode 2026, DECRQM, DA2, XTVERSION, XTGETTCAP)
+* [Runtime font zoom and per-style fonts](#fonts-and-runtime-zoom)
+* [Configurable hotkeys](#hotkeys), [drag and drop](#drag-and-drop),
+  [blinking cursor styles](#cursor), a [light theme](#colours) and a
+  [translucent background with a gradient](#background-opacity-and-gradient)
+
+The full list of where st-rs behaves differently from st is under
+[Intentional differences](#intentional-differences).
 
 ## Requirements
 
