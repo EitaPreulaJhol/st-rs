@@ -5,7 +5,7 @@
 PREFIX = /usr/local
 MANPREFIX = $(PREFIX)/share/man
 DESTDIR =
-VERSION = 0.9.3
+VERSION = 0.10.0
 CARGO = cargo
 DOCKER_COMPOSE = docker compose
 RELEASE = target/release/st

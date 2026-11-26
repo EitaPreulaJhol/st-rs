@@ -64,6 +64,23 @@ sudo make install PREFIX=/usr
 The Makefile installs the binary, the man page and runs `tic -sx st.info` so the
 `st-256color` terminfo entry is available.
 
+### Prebuilt releases
+
+Each [GitHub release](https://github.com/EitaPreulaJhol/st-rs/releases) has a
+`st-rs-<version>-linux-x86_64.tar.gz` with the binary, the man page,
+`st.info`, the README and the license (plus a `.sha256` checksum). The binary
+is built by GitHub Actions on Ubuntu 22.04 and needs the Xlib, Xft,
+fontconfig and freetype shared libraries. Run `tic -sx st.info` to install the
+terminfo entry.
+
+Releases are made by pushing an annotated tag that matches the version in
+`Cargo.toml`; its message becomes the release notes:
+
+```sh
+git tag -a v0.10.0 -m "st-rs 0.10.0" -m "Release notes..."
+git push origin v0.10.0
+```
+
 ## Configuration
 
 `src/config.rs` mirrors the original `config.h`: font, border width, shell,
@@ -322,7 +339,7 @@ st also answers the queries programs use to discover these features:
 | --- | --- |
 | DECRQM, `CSI ? Ps $ p` / `CSI Ps $ p` | `CSI ? Ps ; Pm $ y` (1 set, 2 reset, 4 permanently reset, 0 unknown) |
 | DA2, `CSI > c` | `VTIDEN2` (`CSI > 1 ; 903 ; 0 c`) |
-| XTVERSION, `CSI > q` | `DCS > \| st 0.9.3-rs ST` |
+| XTVERSION, `CSI > q` | `DCS > \| st 0.10.0-rs ST` (the crate version) |
 | XTGETTCAP, `DCS + q <hex names> ST` | `TN`, `Co`, `RGB`, `Tc`, `Su`, `Smulx`, `Setulc`, `Sync`, `Ss`, `Se` |
 
 Other sequences with a `>`, `=` or `<` prefix (xterm's modifyOtherKeys,

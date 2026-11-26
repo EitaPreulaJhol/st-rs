@@ -49,7 +49,7 @@ pub const STTY_ARGS: &str = "stty raw pass8 nl -echo -iexten -cstopb 38400";
 pub const VTIDEN: &[u8] = b"\x1b[?6c";
 
 /// Secondary device attributes (`CSI > c`): terminal type ; firmware
-/// version ; ROM cartridge.  The version is st's, 0.9.3 → 903.
+/// version ; ROM cartridge.  The version is that of upstream st, 0.9.3 → 903.
 pub const VTIDEN2: &[u8] = b"\x1b[>1;903;0c";
 
 /// Longest time (milliseconds) drawing is held back while an application
