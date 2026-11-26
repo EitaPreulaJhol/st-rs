@@ -1992,6 +1992,18 @@ pub static SHORTCUTS: &[Shortcut] = &[
     },
     Shortcut {
         mask: (ControlMask | ShiftMask),
+        keysym: x11::keysym::XK_Return as u64,
+        func: App::newterm,
+        arg: Arg::i(0),
+    },
+    Shortcut {
+        mask: (ControlMask | ShiftMask),
+        keysym: x11::keysym::XK_KP_Enter as u64,
+        func: App::newterm,
+        arg: Arg::i(0),
+    },
+    Shortcut {
+        mask: (ControlMask | ShiftMask),
         keysym: x11::keysym::XK_C as u64,
         func: App::clipcopy,
         arg: Arg::i(0),

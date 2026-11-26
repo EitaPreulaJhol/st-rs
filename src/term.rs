@@ -510,10 +510,16 @@ fn findurlprefix(buf: &[u8], from: usize) -> Option<usize> {
 /// screen or in the history are dropped.
 pub const LINKMAX: usize = 4096;
 
-/// The path of an OSC 7 `file://host/path` report, `%xx`-decoded.
-pub fn osc7_path(uri: &[u8]) -> Option<Vec<u8>> {
+/// The path of an OSC 7 `file://host/path` report, `%xx`-decoded.  Reports
+/// from other hosts (a shell behind ssh) are ignored: `localhost` and an
+/// empty host stand for `thishost`.
+pub fn osc7_path(uri: &[u8], thishost: &[u8]) -> Option<Vec<u8>> {
     let rest = uri.strip_prefix(b"file://")?;
     let slash = rest.iter().position(|&b| b == b'/')?;
+    let host = &rest[..slash];
+    if !(host.is_empty() || host == b"localhost" || host == thishost) {
+        return None;
+    }
     let mut out = Vec::new();
     let enc = &rest[slash..];
     let mut i = 0;
@@ -532,6 +538,17 @@ pub fn osc7_path(uri: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(out)
+}
+
+/// This machine's host name.
+pub fn hostname() -> Vec<u8> {
+    let mut buf = [0u8; 256];
+    let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if r != 0 {
+        return Vec::new();
+    }
+    let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf[..n].to_vec()
 }
 
 impl App {
@@ -780,6 +797,86 @@ impl App {
             } else if pid > 0 {
                 let mut status: libc::c_int = 0;
                 libc::waitpid(pid, &mut status, 0);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// New terminal in the current directory
+// ---------------------------------------------------------------------------
+
+impl App {
+    /// Working directory for a new terminal: the one the shell reported
+    /// through OSC 7, else the foreground process's, else the shell's.
+    pub fn newterm_dir(&self) -> Option<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        if let Some(d) = &self.cwd {
+            let p = std::path::Path::new(std::ffi::OsStr::from_bytes(d));
+            if p.is_dir() {
+                return Some(p.to_path_buf());
+            }
+        }
+        let fg = unsafe { libc::tcgetpgrp(self.iofd) };
+        let shell = PID.load(Ordering::Relaxed);
+        [fg, shell]
+            .into_iter()
+            .filter(|&p| p > 0)
+            .find_map(|p| std::fs::read_link(format!("/proc/{}/cwd", p)).ok())
+            .filter(|p| p.is_dir())
+    }
+
+    /// Arguments for a new terminal: this one's font, opacity, class and
+    /// alternate-screen setting, but not its command, line or embedding.
+    pub fn newterm_args(&self) -> Vec<CString> {
+        let mut args = vec![CString::new("st").unwrap()];
+        if let Some(f) = &self.opts.font {
+            args.push(CString::new("-f").unwrap());
+            args.push(f.clone());
+        }
+        if let Some(c) = &self.opts.class {
+            args.push(CString::new("-c").unwrap());
+            args.push(c.clone());
+        }
+        if !self.allowaltscreen {
+            args.push(CString::new("-a").unwrap());
+        }
+        args.push(CString::new("-A").unwrap());
+        args.push(CString::new(format!("{}", self.alpha)).unwrap());
+        args
+    }
+
+    /// Open another st window in the current directory (`Ctrl+Shift+Enter`).
+    pub fn newterm(&mut self, _arg: &Arg) {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = self
+            .newterm_dir()
+            .and_then(|d| CString::new(d.as_os_str().as_bytes()).ok());
+        let exe = CString::new("/proc/self/exe").unwrap();
+        let args = self.newterm_args();
+        let mut argv: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
+        argv.push(ptr::null());
+        let maxfd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }.clamp(256, 65536) as i32;
+
+        // Double fork, like followurl: the new terminal is re-parented to
+        // init and never seen by the SIGCHLD handler.
+        unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::setsid();
+                if libc::fork() == 0 {
+                    if let Some(d) = &dir {
+                        libc::chdir(d.as_ptr());
+                    }
+                    for fd in 3..maxfd {
+                        libc::close(fd);
+                    }
+                    libc::execv(exe.as_ptr(), argv.as_ptr());
+                }
+                libc::_exit(0);
+            } else if pid > 0 {
+                let mut status: libc::c_int = 0;
+                while libc::waitpid(pid, &mut status, 0) < 0 && read_errno() == libc::EINTR {}
             }
         }
     }
@@ -2479,7 +2576,8 @@ impl App {
                     7 => {
                         // current working directory: OSC 7 ; file://host/path
                         let data = self.strescseq.buf[..self.strescseq.len].to_vec();
-                        if let Some(path) = data.get(2..).and_then(osc7_path) {
+                        let host = hostname();
+                        if let Some(path) = data.get(2..).and_then(|u| osc7_path(u, &host)) {
                             self.cwd = Some(path);
                         }
                         return;
@@ -4384,12 +4482,34 @@ mod tests {
 
     #[test]
     fn osc7_reports_the_directory() {
-        assert_eq!(osc7_path(b"file://host/home/me/a%20b"), Some(b"/home/me/a b".to_vec()));
-        assert_eq!(osc7_path(b"file:///tmp"), Some(b"/tmp".to_vec()));
-        assert_eq!(osc7_path(b"http://host/tmp"), None);
-        assert_eq!(osc7_path(b"file://host/a%00b"), None);
+        assert_eq!(osc7_path(b"file://host/home/me/a%20b", b"host"), Some(b"/home/me/a b".to_vec()));
+        assert_eq!(osc7_path(b"file:///tmp", b"host"), Some(b"/tmp".to_vec()));
+        assert_eq!(osc7_path(b"file://localhost/tmp", b"host"), Some(b"/tmp".to_vec()));
+        assert_eq!(osc7_path(b"file://elsewhere/tmp", b"host"), None);
+        assert_eq!(osc7_path(b"http://host/tmp", b"host"), None);
+        assert_eq!(osc7_path(b"file://host/a%00b", b"host"), None);
         let mut app = new_app(10, 2);
-        feed(&mut app, b"\x1b]7;file://box/srv/x\x1b\\");
+        feed(&mut app, format!("\x1b]7;file://{}/srv/x\x1b\\", String::from_utf8_lossy(&hostname())).as_bytes());
         assert_eq!(app.cwd, Some(b"/srv/x".to_vec()));
+    }
+
+    #[test]
+    fn newterm_arguments_and_directory() {
+        let mut app = new_app(10, 2);
+        app.alpha = 0.5;
+        let args: Vec<String> = app.newterm_args().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["st", "-A", "0.5"]);
+        app.opts.font = Some(CString::new("Mono:pixelsize=12").unwrap());
+        app.opts.cmd = vec![CString::new("top").unwrap()];
+        app.allowaltscreen = false;
+        let args: Vec<String> = app.newterm_args().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["st", "-f", "Mono:pixelsize=12", "-a", "-A", "0.5"]);
+
+        // OSC 7 wins when it names a directory; otherwise /proc is used.
+        app.cwd = Some(b"/".to_vec());
+        assert_eq!(app.newterm_dir(), Some(std::path::PathBuf::from("/")));
+        app.cwd = Some(b"/nonexistent/dir".to_vec());
+        PID.store(std::process::id() as i32, Ordering::Relaxed);
+        assert_eq!(app.newterm_dir(), std::env::current_dir().ok());
     }
 }
