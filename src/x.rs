@@ -13,6 +13,7 @@ use x11::xrender::{XGlyphInfo, XRenderColor};
 
 use crate::app::Font; // disambiguate from xlib::Font
 use crate::app::*;
+use crate::boxdraw;
 use crate::config;
 use crate::config::{
     DEFAULTATTR, DEFAULTBG, DEFAULTFG, DOUBLECLICKTIMEOUT, MAXLATENCY, MINLATENCY,
@@ -1799,6 +1800,8 @@ impl App {
         numspecs
     }
 
+    /// Draw a run of glyphs sharing `base`'s attributes.  `boxrunes` holds
+    /// the characters of a run drawn by `boxdraw` instead of the font.
     fn xdrawglyphfontspecs(
         &mut self,
         specs: &[XftGlyphFontSpec],
@@ -1806,6 +1809,7 @@ impl App {
         len: usize,
         x: i32,
         y: i32,
+        boxrunes: Option<&[Rune]>,
     ) {
         let charlen = len * if base.mode & ATTR_WIDE != 0 { 2 } else { 1 };
         let winx = config::BORDERPX + x * self.win.cw;
@@ -2017,7 +2021,46 @@ impl App {
         };
         unsafe {
             XftDrawSetClipRectangles(self.xw.draw, winx, winy, &r, 1);
-            XftDrawGlyphFontSpec(self.xw.draw, &fg_col, specs.as_ptr(), len as c_int);
+        }
+        if let Some(runes) = boxrunes {
+            let cellw = if base.mode & ATTR_WIDE != 0 { 2 * self.win.cw } else { self.win.cw };
+            for (k, &u) in runes.iter().enumerate() {
+                let cx = winx + k as i32 * cellw;
+                for br in boxdraw::boxdraw(u, cellw, self.win.ch).unwrap_or_default() {
+                    let mut col = fg_col;
+                    if br.shade < 4 {
+                        col = unsafe {
+                            let mix = |f: c_ushort, b: c_ushort| -> c_ushort {
+                                ((b as u32 * (4 - br.shade as u32) + f as u32 * br.shade as u32) / 4)
+                                    as c_ushort
+                            };
+                            alloc_color(
+                                self.xw.dpy,
+                                self.xw.vis,
+                                self.xw.cmap,
+                                mix(fg_col.color.red, bg_col.color.red),
+                                mix(fg_col.color.green, bg_col.color.green),
+                                mix(fg_col.color.blue, bg_col.color.blue),
+                                bg_col.color.alpha.max(mix(fg_col.color.alpha, bg_col.color.alpha)),
+                            )
+                        };
+                    }
+                    unsafe {
+                        XftDrawRect(
+                            self.xw.draw,
+                            &col,
+                            cx + br.x,
+                            winy + br.y,
+                            br.w as c_uint,
+                            br.h as c_uint,
+                        );
+                    }
+                }
+            }
+        } else {
+            unsafe {
+                XftDrawGlyphFontSpec(self.xw.draw, &fg_col, specs.as_ptr(), len as c_int);
+            }
         }
 
         // Underline and strikethrough.
@@ -2138,7 +2181,9 @@ impl App {
     pub fn xdrawglyph(&mut self, g: Glyph, x: i32, y: i32) {
         let mut spec: [XftGlyphFontSpec; 1] = unsafe { std::mem::zeroed() };
         let numspecs = self.xmakeglyphfontspecs(&mut spec, &[g], x, y);
-        self.xdrawglyphfontspecs(&spec[..numspecs], g, numspecs, x, y);
+        let runes = [g.u];
+        let boxrunes = (config::BOXDRAW && boxdraw::is_boxdraw(g.u)).then_some(&runes[..]);
+        self.xdrawglyphfontspecs(&spec[..numspecs], g, numspecs, x, y, boxrunes);
     }
 
     pub fn xdrawcursor(&mut self, cx: i32, cy: i32, mut g: Glyph, ox: i32, oy: i32, mut og: Glyph) {
@@ -2360,6 +2405,9 @@ impl App {
         let mut off = 0usize;
         let mut remaining = numspecs;
         let mut base = Glyph::default();
+        // Box-drawing characters are drawn in runs of their own.
+        let mut basebox = false;
+        let mut runes: Vec<Rune> = Vec::new();
 
         let mut x = x1;
         while x < x2 && i < remaining {
@@ -2371,8 +2419,10 @@ impl App {
             if self.selected(x, y1) {
                 new.mode ^= ATTR_REVERSE;
             }
-            if i > 0 && !base.same_attr(&new) {
-                self.xdrawglyphfontspecs(&specs_buf[off..off + i], base, i, ox, y1);
+            let newbox = config::BOXDRAW && boxdraw::is_boxdraw(new.u);
+            if i > 0 && (!base.same_attr(&new) || basebox != newbox) {
+                let br = basebox.then_some(&runes[..]);
+                self.xdrawglyphfontspecs(&specs_buf[off..off + i], base, i, ox, y1, br);
                 off += i;
                 remaining -= i;
                 i = 0;
@@ -2380,12 +2430,16 @@ impl App {
             if i == 0 {
                 ox = x;
                 base = new;
+                basebox = newbox;
+                runes.clear();
             }
+            runes.push(new.u);
             i += 1;
             x += 1;
         }
         if i > 0 {
-            self.xdrawglyphfontspecs(&specs_buf[off..off + i], base, i, ox, y1);
+            let br = basebox.then_some(&runes[..]);
+            self.xdrawglyphfontspecs(&specs_buf[off..off + i], base, i, ox, y1, br);
         }
 
         self.xw.specbuf = specs_buf;

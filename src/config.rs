@@ -56,6 +56,11 @@ pub const VTIDEN2: &[u8] = b"\x1b[>1;903;0c";
 /// keeps synchronized output (mode 2026) switched on.
 pub const SYNCTIMEOUT: f64 = 150.0;
 
+/// Draw box-drawing characters (U+2500–U+257F) and block elements
+/// (U+2580–U+259F) with rectangles instead of the font, so lines and blocks
+/// join without gaps.  Diagonals always come from the font.
+pub const BOXDRAW: bool = true;
+
 /// Kerning / character bounding-box multipliers.
 pub const CWSCALE: f32 = 1.0;
 pub const CHSCALE: f32 = 1.0;
