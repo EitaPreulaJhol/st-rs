@@ -274,6 +274,11 @@ pub struct Term {
     pub icharset: i32,
     pub tabs: Vec<bool>,
     pub lastc: Rune,
+    /// Bumped whenever output or a resize may have changed the contents.
+    pub gen: u64,
+    /// Number of history lines dropped from the front so far, so positions
+    /// in the history can be kept stable while it rotates.
+    pub histdrop: u64,
 }
 
 impl Default for Term {
@@ -304,6 +309,8 @@ impl Term {
             icharset: 0,
             tabs: Vec::new(),
             lastc: 0,
+            gen: 0,
+            histdrop: 0,
         }
     }
 }

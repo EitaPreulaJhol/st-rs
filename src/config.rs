@@ -61,6 +61,17 @@ pub const SYNCTIMEOUT: f64 = 150.0;
 /// join without gaps.  Diagonals always come from the font.
 pub const BOXDRAW: bool = true;
 
+/// Scrollback search (`Ctrl+Shift+F`): the bar's prompt and colours (palette
+/// indices or `DEFAULTFG`/`DEFAULTBG`), and the colours of the matches and of
+/// the current match.
+pub const SEARCH_PROMPT: &str = "Search: ";
+pub const SEARCH_BAR_FG: u32 = DEFAULTBG;
+pub const SEARCH_BAR_BG: u32 = DEFAULTFG;
+pub const SEARCH_FG: u32 = 0;
+pub const SEARCH_BG: u32 = 11;
+pub const SEARCH_CUR_FG: u32 = 15;
+pub const SEARCH_CUR_BG: u32 = 3;
+
 /// Kerning / character bounding-box multipliers.
 pub const CWSCALE: f32 = 1.0;
 pub const CHSCALE: f32 = 1.0;
@@ -1972,6 +1983,12 @@ pub static SHORTCUTS: &[Shortcut] = &[
         keysym: x11::keysym::XK_0 as u64,
         func: App::zoomreset,
         arg: Arg::f(0f32),
+    },
+    Shortcut {
+        mask: (ControlMask | ShiftMask),
+        keysym: x11::keysym::XK_F as u64,
+        func: App::searchstart,
+        arg: Arg::i(0),
     },
     Shortcut {
         mask: (ControlMask | ShiftMask),

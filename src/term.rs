@@ -1155,7 +1155,7 @@ extern "C" fn sigchld_handler(_sig: libc::c_int) {
 /// Whether a screen row continues on the next one.  The mark normally sits
 /// on the last cell, but `tputc` puts it on the double-width cell when a wide
 /// character ends the row, so both places are checked.
-fn line_is_wrapped(line: &Line) -> bool {
+pub fn line_is_wrapped(line: &Line) -> bool {
     let n = line.len();
     if n == 0 {
         return false;
@@ -1298,6 +1298,7 @@ impl App {
         self.term.hist.push_back(line);
         while self.term.hist.len() > config::SCROLLBACK {
             self.term.hist.pop_front();
+            self.term.histdrop += 1;
         }
         // Keep the displayed history stable while new output arrives.
         if self.term.scr > 0 {
@@ -2935,6 +2936,7 @@ impl App {
     }
 
     pub fn twrite(&mut self, buf: &[u8], buflen: i32, show_ctrl: bool) -> i32 {
+        self.term.gen = self.term.gen.wrapping_add(1);
         let buflen = buflen as usize;
         let mut n = 0usize;
         while n < buflen {
@@ -2966,6 +2968,7 @@ impl App {
     }
 
     pub fn tresize(&mut self, col: i32, row: i32) {
+        self.term.gen = self.term.gen.wrapping_add(1);
         if col < 1 || row < 1 {
             eprintln!("tresize: error resizing to {}x{}", col, row);
             return;
@@ -3365,7 +3368,10 @@ impl App {
                 continue;
             }
             self.term.dirty[y as usize] = false;
-            let line = self.tline(y).clone();
+            let mut line = self.tline(y).clone();
+            if self.search.is_some() {
+                self.search_highlight(y, &mut line);
+            }
             self.xdrawline(&line, x1, y, x2);
         }
     }
@@ -3378,6 +3384,7 @@ impl App {
         if !self.xstartdraw() {
             return;
         }
+        self.search_predraw();
 
         // While viewing history, all visible rows depend on the offset; a
         // normal dirty-row update would mark the wrong screen rows.
@@ -3395,7 +3402,11 @@ impl App {
         }
 
         self.drawregion(0, 0, self.term.col, self.term.row);
-        if self.term.scr == 0 {
+        if let Some(bar) = self.searchbar() {
+            // Drawn over the last row on every frame; closing the bar marks
+            // the screen dirty.
+            self.xdrawline(&bar, 0, self.term.row - 1, self.term.col);
+        } else if self.term.scr == 0 {
             let g = self.term.line[self.term.c.y as usize][cx as usize];
             let og = self.term.line[self.term.ocy as usize][self.term.ocx as usize];
             self.xdrawcursor(cx, self.term.c.y, g, self.term.ocx, self.term.ocy, og);

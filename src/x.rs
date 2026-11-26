@@ -2678,6 +2678,13 @@ impl App {
             }
         }
 
+        // The search bar takes the keyboard while it is open.
+        if self.search.is_some() {
+            let n = len.max(0) as usize;
+            self.searchkey(ksym, e.state, &buf[..n]);
+            return;
+        }
+
         // Highlight URLs while Ctrl is held; Ctrl+Click follows them.
         if self.is_ctrl_key(e.keycode as c_uint) {
             self.highlighturls();
