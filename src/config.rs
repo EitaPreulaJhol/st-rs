@@ -104,7 +104,7 @@ pub const MAXLATENCY: f64 = 33.0;
 pub const BLINKTIMEOUT: u64 = 800;
 pub const CURSORTHICKNESS: u32 = 2;
 pub const BELLVOLUME: i32 = 0;
-pub const TERMNAME: &str = "st-256color";
+pub const TERMNAME: &str = "xterm-256color";
 pub const TABSPACES: u32 = 8;
 
 /// Maximum number of lines kept in the scrollback buffer.  Set to 0 to
